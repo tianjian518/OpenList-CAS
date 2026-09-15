@@ -1,0 +1,7 @@
+node_modules
+dist
+dist-server
+public_data
+.dev.vars
+.env
+*.log
