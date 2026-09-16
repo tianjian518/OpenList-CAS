@@ -140,6 +140,14 @@ function setDriverCache(key: string, driver: StorageDriver): void {
 export interface StorageRequestContext {
   waitUntil?: (promise: Promise<unknown>) => void
   env?: any // ESA/Cloudflare env，用于请求级缓存复用
+  /**
+   * 当次请求的站点 origin（如 `https://tj518.de5.net`）。
+   *
+   * 对齐 Go：Go 侧 `common.GetApiUrl(ctx)` 从 context 里读请求级站点地址，
+   * 驱动（尤其 strm）在生成直链时会用到。TS 版没有 ctx，改用显式字段，
+   * 由 server 层构造 requestContext 时填好，op 层再透传给 getDriver。
+   */
+  requestOrigin?: string
 }
 
 export async function getOrCreateDriver(
@@ -1486,7 +1494,14 @@ export async function listItems(
   if (resolved.storage) {
     driverName = resolved.storage.driver
     try {
-      const driver = await getDriver(driverName, resolved.storage)
+      // 注入当次请求 origin：strm 驱动据此把 .strm 内容写成绝对 URL
+      // （对齐 Go 的 `common.GetApiUrl(ctx)` —— Go 通过 ctx 把请求级信息
+      //  一路透传到驱动，TS 版靠这个显式参数等价实现）。
+      const driver = await getDriver(
+        driverName,
+        resolved.storage,
+        requestContext?.requestOrigin,
+      )
       // Get raw items from driver
       try {
         items = await driver.list(virtualPath, resolved.physical!)
@@ -1604,7 +1619,12 @@ export async function getItem(
   }
 
   const driverName = resolved.storage ? resolved.storage.driver : "Local"
-  const driver = await getDriver(driverName, resolved.storage)
+  // 与 listItems 同源：把请求 origin 透传给驱动（strm 需要它生成绝对 URL）
+  const driver = await getDriver(
+    driverName,
+    resolved.storage,
+    requestContext?.requestOrigin,
+  )
   let item: FileItem
   try {
     item = await driver.get(virtualPath, resolved.physical!)

@@ -7,6 +7,7 @@ import {
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
 import { signWithSecret } from "../../pkg/sign"
+import { goEncodePath } from "../../pkg/urlpath"
 import { StrmAddition } from "./types"
 
 interface RemoteTarget {
@@ -42,7 +43,28 @@ function getPair(path: string): [string, string] {
   return [segs[segs.length - 1] || path, path]
 }
 
-function getRootAndPath(path: string): [string, string] {
+/**
+ * 与 Go `(d *Strm) getRootAndPath` 等价 —— 注意 autoFlatten 分支：
+ *
+ *   func (d *Strm) getRootAndPath(path string) (string, string) {
+ *     if d.autoFlatten { return d.oneKey, path }   // ← sub 保留【带前导 /】的原路径
+ *     path = strings.TrimPrefix(path, "/")
+ *     parts := strings.SplitN(path, "/", 2)
+ *     if len(parts) == 1 { return parts[0], "" }
+ *     return parts[0], parts[1]
+ *   }
+ *
+ * 两种模式语义不同：
+ *   - autoFlatten：sub 是**以 / 开头的完整路径**（后续 `stdpath.Join(dst, sub)` 靠它拼接）
+ *   - 非 autoFlatten：sub 已被 TrimPrefix 掉前导 /，且**只取第一段之后的部分**，
+ *     由调用方用 Join(dst, sub) 拼出完整物理路径。
+ */
+function getRootAndPath(
+  path: string,
+  autoFlatten = false,
+  oneKey = "",
+): [string, string] {
+  if (autoFlatten) return [oneKey, String(path || "/")]
   const p = String(path || "/").replace(/^\//, "")
   const idx = p.indexOf("/")
   if (idx < 0) return [p, ""]
@@ -120,11 +142,16 @@ export class StrmDriver implements StorageDriver {
     }
   }
 
+  /**
+   * 与 Go `utils.EncodePath(path, true)` 完全等价 —— 按 `/` 切段，
+   * 每段做 `url.PathEscape`。
+   *
+   * 此前用 `encodeURIComponent(seg)` 是**错的**：它会把 `$ & + , : ; = @`
+   * 一并转义，而 Go `url.PathEscape` 保留这些子分隔符。
+   * 结果是含 `+` / `:` / `,` 的文件名在两边生成不同的 URL。
+   */
   private encodePath(path: string): string {
-    return path
-      .split("/")
-      .map((seg) => encodeURIComponent(seg))
-      .join("/")
+    return goEncodePath(path)
   }
 
   /**
@@ -169,24 +196,6 @@ export class StrmDriver implements StorageDriver {
     const prefix = this.addition.PathPrefix || "/d"
     finalPath = joinPath(prefix, finalPath)
     if (!finalPath.startsWith("/")) finalPath = "/" + finalPath
-
-    // ── 强制走代理（可选，casProxy）────────────────────────────────────
-    //
-    // 为什么需要：
-    //   139 的 CAS 秒传恢复出的临时文件只拿得到 EOS 中转链，该链有两个
-    //   致命问题：
-    //     ① `Content-Disposition: attachment` —— 播放器（实测网易爆米花）
-    //        判定为"待下载文件"而非可播放媒体，报"获取播放地址失败"；
-    //     ② HEAD 请求返回 403（仅 GET / GET+Range 正常）—— 播放器播放前
-    //        普遍先发 HEAD 探测，拿到 403 直接放弃。
-    //   走 OpenList 自己的代理后，服务端会改写为 inline 并把 HEAD 降级为
-    //   GET，两个问题一并消除（见 server/raw.ts）。
-    //
-    // 代价：字节流经 Worker，会消耗 CF 的请求/流量额度。默认关闭，
-    // 由管理员按需（casProxy）开启；纯 .strm 场景本身不需要。
-    if (this.addition.casProxy && !this.addition.withoutUrl) {
-      finalPath += finalPath.includes("?") ? "&proxy=true" : "?proxy=true"
-    }
 
     if (this.addition.withoutUrl) return finalPath
     // 对齐 Go `common.GetApiUrl(ctx)`：
@@ -246,9 +255,31 @@ export class StrmDriver implements StorageDriver {
     return signWithSecret(secret, path, expire)
   }
 
-  private ext(name: string): string {
+  /**
+   * 与 Go `utils.SourceExt(name)` 等价：
+   *   ext := path.Ext(name); if len(ext) > 0 && ext[0] == '.' { ext = ext[1:] }
+   * 返回**不含点**的扩展名（Go 侧大小写原样，调用方再 ToLower）。
+   *
+   * 与 JS 直觉的差异（之前用 `lastIndexOf(".")` 的写法会跑偏）：
+   *   `.gitignore`   → Go: "gitignore"（无扩展名判断按整名切）  JS 直觉: "gitignore"
+   *   `无扩展名`      → Go: ""                        JS 直觉: ""
+   *   `a.b.c`        → Go: "c"                       JS 直觉: "c"
+   */
+  private sourceExt(name: string): string {
     const idx = name.lastIndexOf(".")
-    return idx >= 0 ? name.slice(idx + 1).toLowerCase() : ""
+    // Go 的 path.Ext 对 `.gitignore`（唯一点且在首位）**也**返回 ".gitignore"，
+    // 因为 path.Ext 的规则是「最后一个 '.' 及其后缀」，不排除首字符。
+    return idx >= 0 ? name.slice(idx + 1) : ""
+  }
+
+  /**
+   * 与 Go `strings.TrimSuffix(s, suffix)` 等价。
+   * `sourceExt === ""` 时 Go 的 TrimSuffix 是**空操作**（不会误删结尾），
+   * JS 的 `replace(/\.[^.]+$/,"")` 却可能删掉点号结尾，故单独实现。
+   */
+  private trimSuffix(s: string, suffix: string): string {
+    if (!suffix) return s
+    return s.endsWith(suffix) ? s.slice(0, s.length - suffix.length) : s
   }
 
   private async listRemote(dst: string, sub: string): Promise<FileItem[]> {
@@ -272,12 +303,18 @@ export class StrmDriver implements StorageDriver {
         result.push(item)
         continue
       }
-      const e = this.ext(item.name)
+      const sourceExt = this.sourceExt(item.name)
+      const e = sourceExt.toLowerCase()
       const originalPath = joinPath(reqPath, item.name)
       if (this.downloadSuffix.has(e)) {
         result.push({ ...item, size: item.size })
       } else if (this.supportSuffix.has(e)) {
-        const strmName = item.name.replace(/\.[^.]+$/, "") + ".strm"
+        // 对齐 Go：`name = strings.TrimSuffix(name, sourceExt) + "strm"`
+        // 注意 Go 的 sourceExt 是**不带点**的扩展名，TrimSuffix 后没有点，
+        // 于是直接拼 "strm"。之前写成 `replace(/\.[^.]+$/,"") + ".strm"`
+        // 结果虽然一致，但无扩展名（sourceExt === ""）时 TrimSuffix 是空操作、
+        // 会拼出 `name + "strm"`，与 JS 版行为不同。
+        const strmName = this.trimSuffix(item.name, sourceExt) + "strm"
         const strmUrl = await this.getLink(originalPath)
         result.push({
           name: strmName,
@@ -314,12 +351,7 @@ export class StrmDriver implements StorageDriver {
       return items
     }
 
-    const { root, sub } = this.autoFlatten
-      ? { root: this.oneKey, sub: path.replace(/^\//, "") }
-      : (() => {
-          const [r, s] = getRootAndPath(path)
-          return { root: r, sub: s }
-        })()
+    const [root, sub] = getRootAndPath(path, this.autoFlatten, this.oneKey)
 
     const dsts = this.pathMap.get(root)
     if (!dsts) throw new Error(`[Strm] path not found: ${path}`)
@@ -353,7 +385,7 @@ export class StrmDriver implements StorageDriver {
       return item
     }
 
-    const [root, sub] = getRootAndPath(path)
+    const [root, sub] = getRootAndPath(path, this.autoFlatten, this.oneKey)
     const dsts = this.pathMap.get(root)
     if (!dsts) throw new Error(`[Strm] path not found: ${path}`)
     for (const dst of dsts) {

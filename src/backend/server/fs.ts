@@ -61,6 +61,9 @@ const getStorageRequestContext = (c: any) => {
     return {
       waitUntil: (promise: Promise<unknown>) => executionCtx.waitUntil(promise),
       env: c.env, // 传递 env 用于请求级 KV 缓存复用
+      // 请求级站点 origin：op 层会把它透传给 getDriver，
+      // strm 驱动据此生成绝对 URL（对齐 Go common.GetApiUrl(ctx)）
+      requestOrigin: getRequestOrigin(c),
     }
   } catch {
     return undefined
