@@ -169,6 +169,25 @@ export class StrmDriver implements StorageDriver {
     const prefix = this.addition.PathPrefix || "/d"
     finalPath = joinPath(prefix, finalPath)
     if (!finalPath.startsWith("/")) finalPath = "/" + finalPath
+
+    // ── 强制走代理（可选，casProxy）────────────────────────────────────
+    //
+    // 为什么需要：
+    //   139 的 CAS 秒传恢复出的临时文件只拿得到 EOS 中转链，该链有两个
+    //   致命问题：
+    //     ① `Content-Disposition: attachment` —— 播放器（实测网易爆米花）
+    //        判定为"待下载文件"而非可播放媒体，报"获取播放地址失败"；
+    //     ② HEAD 请求返回 403（仅 GET / GET+Range 正常）—— 播放器播放前
+    //        普遍先发 HEAD 探测，拿到 403 直接放弃。
+    //   走 OpenList 自己的代理后，服务端会改写为 inline 并把 HEAD 降级为
+    //   GET，两个问题一并消除（见 server/raw.ts）。
+    //
+    // 代价：字节流经 Worker，会消耗 CF 的请求/流量额度。默认关闭，
+    // 由管理员按需（casProxy）开启；纯 .strm 场景本身不需要。
+    if (this.addition.casProxy && !this.addition.withoutUrl) {
+      finalPath += finalPath.includes("?") ? "&proxy=true" : "?proxy=true"
+    }
+
     if (this.addition.withoutUrl) return finalPath
     // 对齐 Go `common.GetApiUrl(ctx)`：
     //   apiUrl := d.SiteUrl

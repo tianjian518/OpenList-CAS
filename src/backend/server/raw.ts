@@ -25,6 +25,42 @@ async function initNodeModules() {
 
 export const rawRouter = new Hono()
 
+/**
+ * 构造 `inline` 形式的 Content-Disposition。
+ *
+ * 为什么必须改写：
+ *   139 的 EOS 中转链固定返回
+ *   `Content-Disposition: attachment; filename*=UTF-8''xxx.mp4`。
+ *   播放器（实测网易爆米花）据此把响应判定为"待下载文件"而非"可播放媒体"，
+ *   于是报"获取播放地址失败"。改成 inline 后浏览器/播放器按内联媒体处理。
+ *
+ * 文件名优先沿用上游原始 filename*，前端展示更贴近真实文件名；
+ * 拿不到则用请求路径的最后一段兜底。所有取值都经过 CR/LF 清洗，
+ * 避免响应头注入。
+ */
+function buildInlineDisposition(
+  upstream: string | null,
+  reqPath: string,
+): string {
+  const sanitize = (v: string) => v.replace(/[\r\n\u0000-\u001f]+/g, "")
+
+  if (upstream) {
+    const cleaned = sanitize(upstream)
+    // `attachment; filename*=UTF-8''a.mp4` → 取分号之后的部分
+    const semi = cleaned.indexOf(";")
+    if (semi >= 0) {
+      const params = cleaned.slice(semi + 1).trim()
+      if (params) return `inline; ${params}`
+    }
+    // 上游只给了裸类型（无 filename），退到路径推导
+  }
+
+  const base = reqPath.split("/").filter(Boolean).pop() || "file"
+  // 非 ASCII 文件名用 RFC 5987 的 filename* 编码，避免 header 出现原始中文
+  const encoded = encodeURIComponent(base)
+  return `inline; filename="${encoded}"; filename*=UTF-8''${encoded}`
+}
+
 const getStorageRequestContext = (c: any) => {
   try {
     const executionCtx = c.executionCtx
@@ -98,17 +134,37 @@ rawRouter.get("/*", async (c) => {
   //   2) 播放体验 —— 播放器需要 302 到 CDN 直链才能做分片seek。
   //
   // 安全性由 302 分支自带的 assertSafeUrl（SSRF 校验）保障，与其它驱动一致。
-  const isPlaylistFile = /\.(cas|strm)$/i.test(
+  //
+  // ⚠️ 例外：显式带 `?proxy=true` 时必须允许 .cas 走代理。
+  //
+  //   139 的 CAS 秒传恢复出的临时文件只能拿到 EOS 中转链，该链的
+  //   `Content-Disposition` 是 **attachment**（强制下载）。网易爆米花这类
+  //   播放器据此判定"这是要下载的文件而非可播放媒体"，直接报"获取播放
+  //   地址失败"。
+  //   同时 EOS 对 HEAD 请求返回 403（仅 GET/GET+Range 正常），而播放器探测
+  //   可用性普遍先发 HEAD —— 双重障碍。
+  //   代理分支能改写 Content-Disposition 为 inline 并把 HEAD 降级为 GET，
+  //   从而绕开这两个问题。用户可在存储上开 web_proxy 走这条路。
+  const isCasOrStrmFile = /\.(cas|strm)$/i.test(
     decodeURIComponent(c.req.path).split("?")[0],
   )
+  const explicitProxy = c.req.query("proxy") === "true"
 
   const isProxy =
-    !isPlaylistFile &&
-    (c.req.query("proxy") === "true" ||
+    (!isCasOrStrmFile || explicitProxy) &&
+    (explicitProxy ||
       c.req.path.startsWith("/p") ||
       c.req.path.startsWith("/api/p") ||
       c.req.path.startsWith("/sd") ||
       c.req.path.startsWith("/api/sd"))
+
+  // 媒体文件判定（供 Content-Disposition 改写使用）。
+  // 与驱动侧的扩展名习惯保持一致：常见视频/音频/字幕。
+  const MEDIA_EXT_RE =
+    /\.(mp4|mkv|webm|avi|mov|flv|wmv|ts|m2ts|m4v|mpg|mpeg|rmvb|3gp|mp3|flac|aac|wav|ogg|m4a|wma|alac|ape|srt|ass|vtt|sub)$/i
+  const isMediaPath = MEDIA_EXT_RE.test(
+    decodeURIComponent(c.req.path).split("?")[0],
+  )
 
   const rawPath = c.req.path
     .replace(/^\/api\/raw/, "")
@@ -243,6 +299,15 @@ rawRouter.get("/*", async (c) => {
               const rangeReq = c.req.header("Range")
               if (rangeReq) headers["Range"] = rangeReq
 
+              // HEAD 降级为 GET。
+              //
+              // 背景：139 的 EOS 中转链对 HEAD 一律返回 403（GET / GET+Range
+              // 正常返回 200 / 206）。播放器在正式播放前普遍会先发 HEAD 探测
+              // 文件是否可访问、大小多少，拿到 403 就直接判定"不可播放"。
+              // 这里对上游始终用 GET，若客户端本意是 HEAD 则丢弃响应体、
+              // 只回响应头，语义上等价于 HEAD，但对上游友好。
+              const clientWantsHead = c.req.method === "HEAD"
+
               let upstreamRes: Response
               try {
                 upstreamRes = await safeProxyFetch(
@@ -320,15 +385,38 @@ rawRouter.get("/*", async (c) => {
               if (cacheControl) c.header("Cache-Control", cacheControl)
               // FIX(H-3): 上游响应头已按白名单回显，但对 Content-Disposition 额外
               // 清洗 CR/LF 与控制字符，防止恶意上游注入额外响应头（Set-Cookie/Location）。
+              //
+              // 播放场景特例：媒体文件（.cas/.strm 及其它音视频扩展名）必须
+              // 以 inline 回给播放器。
+              // 上游 139 EOS 中转链固定带 `attachment`，播放器会把它当成
+              // "待下载文件"而非"可播放媒体"，表现为"获取播放地址失败"。
+              // 这里对媒体文件强制改写为 inline，仅保留文件名。
               const contentDisposition = upstreamRes.headers.get(
                 "content-disposition",
               )
-              if (contentDisposition) {
+              if (isCasOrStrmFile || isMediaPath) {
+                c.header(
+                  "Content-Disposition",
+                  buildInlineDisposition(contentDisposition, reqPath),
+                )
+              } else if (contentDisposition) {
                 const safeDisposition = contentDisposition.replace(
                   /[\r\n\u0000-\u001f]+/g,
                   "",
                 )
                 c.header("Content-Disposition", safeDisposition)
+              }
+
+              // 客户端本意是 HEAD：只回响应头，丢弃上游响应体。
+              // 上游已用 GET 取得（EOS 对 HEAD 返回 403），这里主动 cancel
+              // 以免无谓地拉取整个文件。
+              if (clientWantsHead) {
+                try {
+                  await upstreamRes.body?.cancel()
+                } catch {
+                  // 忽略：部分运行时 body 不可 cancel
+                }
+                return c.body(null, upstreamRes.status as any)
               }
 
               return c.body(upstreamRes.body as any, upstreamRes.status as any)

@@ -3459,6 +3459,13 @@ const driverConfigs: Record<string, any> = {
       { name: "encodePath", type: "bool", default: "true", required: false },
       { name: "withoutUrl", type: "bool", default: "false", required: false },
       { name: "withSign", type: "bool", default: "false", required: false },
+      {
+        name: "casProxy",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "让 .strm 内的链接走本站代理。开启后可修正 139 CAS 直链带的 attachment 头（播放器会误判为下载）并把 HEAD 降级为 GET。代价是播放流量经本站中转。",
+      },
     ],
     config: {
       name: "Strm",
