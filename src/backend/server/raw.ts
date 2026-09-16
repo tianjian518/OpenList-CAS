@@ -374,7 +374,22 @@ rawRouter.get("/*", async (c) => {
               console.log(
                 `[rawRouter] Redirecting download for '${reqPath}' via ${resolved.storage.driver}`,
               )
-              return c.redirect(fileItem.raw_url, 302)
+              // 对齐 Go：Gin 的 `c.Redirect(302, url)` 会自动带上
+              //   Content-Type: text/html; charset=utf-8
+              //   Cache-Control: max-age=0, no-cache, no-store, must-revalidate
+              //   Referrer-Policy: no-referrer
+              // 而 Hono 的 `c.redirect()` 不带任何 Content-Type、且会写
+              // `Content-Length: 0`。部分播放器（网易爆米花等）在拿到 302 时
+              // 若缺少 Content-Type、或看到 Content-Length 为 0，会把它当成
+              // 「空响应 / 无效响应」直接报「无法获取播放地址」，不会去跟随
+              // Location。这里显式补齐与 Go 一致的头，保证行为逐字节对齐。
+              c.header("Content-Type", "text/html; charset=utf-8")
+              c.header(
+                "Cache-Control",
+                "max-age=0, no-cache, no-store, must-revalidate",
+              )
+              c.header("Referrer-Policy", "no-referrer")
+              return c.body(null, 302, { Location: fileItem.raw_url })
             }
           } else if (
             typeof (driver as any).createReadStream === "function" &&
