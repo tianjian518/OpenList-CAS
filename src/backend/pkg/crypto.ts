@@ -151,6 +151,48 @@ export async function hmacSha1Base64(
   return btoa(binary)
 }
 
+/**
+ * HMAC-SHA256 原始签名字节（Uint8Array）。
+ * 对齐 Go pkg/sign/hmac.go：hmac.New(sha256.New, secret) 后写入 data。
+ */
+export async function hmacSha256Bytes(
+  data: string,
+  key: string,
+): Promise<Uint8Array> {
+  const keyMat = await crypto.subtle.importKey(
+    "raw",
+    toBytes(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  )
+  const sig = await crypto.subtle.sign("HMAC", keyMat, toBytes(data))
+  return new Uint8Array(sig)
+}
+
+/**
+ * HMAC-SHA256 → base64url（无 padding）。
+ *
+ * 对齐 Go `base64.URLEncoding.EncodeToString`：
+ * Go 的 URLEncoding 使用 '-' 与 '_' 字符集，**保留 '=' 填充**。
+ */
+export async function hmacSha256Base64Url(
+  data: string,
+  key: string,
+): Promise<string> {
+  const bytes = await hmacSha256Bytes(data, key)
+  let binary = ""
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_")
+}
+
+/** base64url 解码为字符串（UTF-8），用于比对签名 */
+export function base64UrlDecodeToString(s: string): string {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/")
+  const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4)
+  return atob(padded)
+}
+
 // ─── AES-256-GCM helpers ─────────────────────────────────────────────────────
 
 const PBKDF2_ITERATIONS = 100000

@@ -29,6 +29,7 @@ import {
   getSignPolicy,
   signDownloadPath,
   isEncryptPath,
+  isStorageSignEnabled,
   getSignExpiresIn,
 } from "../pkg/sign"
 import { safeErrorMessage } from "../pkg/errs"
@@ -61,6 +62,21 @@ const getStorageRequestContext = (c: any) => {
       waitUntil: (promise: Promise<unknown>) => executionCtx.waitUntil(promise),
       env: c.env, // 传递 env 用于请求级 KV 缓存复用
     }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 当次请求的站点 origin（如 `https://tj518.de5.net`）。
+ *
+ * 用途：strm 驱动生成 .strm 文件内容时必须写出**绝对 URL**
+ * （对齐 Go `common.GetApiUrl(ctx)`）。没有它就只能输出 `/d/xxx.cas`
+ * 这类相对路径，播放器/媒体库无法解析。
+ */
+const getRequestOrigin = (c: any): string | undefined => {
+  try {
+    return new URL(c.req.url).origin
   } catch {
     return undefined
   }
@@ -325,7 +341,12 @@ fsRouter.post("/list", async (c) => {
     //（历史上 webdav/autoindex 驱动曾把远程路径/URL 塞进该字段）。
     const signPolicy = await getSignPolicy(c)
     const encrypt = await isEncryptPath(c, reqPath)
-    const signNeeded = signPolicy.enabled || encrypt
+    // 存储级 enable_sign（对齐 Go IsStorageSignEnabled）：即使全局 sign_all 关闭，
+    // 只要该存储开了 enable_sign，也必须为文件签发签名。
+    const storageSign = signPolicy.enabled || encrypt
+      ? false
+      : await isStorageSignEnabled(c, reqPath)
+    const signNeeded = signPolicy.enabled || encrypt || storageSign
     const signExpiresIn = signNeeded
       ? signPolicy.expiresIn || (await getSignExpiresIn(c))
       : 0
@@ -513,7 +534,13 @@ fsRouter.post("/get", async (c) => {
     const { item, provider, rawUrl } = await getItem(reqPath, requestContext)
     // 与 /fs/list 同源逻辑，见上方注释
     const signPolicy = await getSignPolicy(c)
-    const signNeeded = signPolicy.enabled || (await isEncryptPath(c, reqPath))
+    const encryptGet = await isEncryptPath(c, reqPath)
+    const storageSignGet =
+      signPolicy.enabled || encryptGet
+        ? false
+        : await isStorageSignEnabled(c, reqPath)
+    const signNeeded =
+      signPolicy.enabled || encryptGet || storageSignGet
     const sign =
       !item.is_dir && signNeeded
         ? await signDownloadPath(
@@ -865,7 +892,7 @@ fsRouter.post("/upload/create", async (c) => {
     if (resolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
-    const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).createUploadSession !== "function") {
       // 当前存储不支持分片会话上传：返回 null，前端自动回退到流式上传
       return c.json({ code: 200, message: "success", data: null })
@@ -924,7 +951,7 @@ fsRouter.put("/upload/part", async (c) => {
     if (resolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
-    const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).uploadPart !== "function") {
       throw new Error("storage does not support chunked upload")
     }
@@ -969,7 +996,7 @@ fsRouter.post("/upload/complete", async (c) => {
     if (resolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
-    const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).completeUploadSession !== "function") {
       throw new Error("storage does not support chunked upload")
     }
@@ -1059,7 +1086,7 @@ fsRouter.post("/other", async (c) => {
     if (resolved.isVirtual || !resolved.storage) {
       throw new Error("failed get storage: storage not found")
     }
-    const driver = await getDriver(resolved.storage.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).other === "function") {
       const data = await (driver as any).other(method, resolved.relative, body)
       return c.json({ code: 200, message: "success", data })
@@ -1241,7 +1268,7 @@ fsRouter.post("/link", async (c) => {
         500,
       )
     }
-    const driver = await getDriver(resolved.storage.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage.driver, resolved.storage, getRequestOrigin(c))
     try {
       const item = await driver.get(reqPath, resolved.physical ?? "/")
       if (item && item.raw_url) {
@@ -1282,7 +1309,7 @@ fsRouter.post("/get_direct_upload_info", async (c) => {
     if (resolved.isVirtual || !resolved.storage) {
       return c.json({ code: 200, message: "success", data: null })
     }
-    const driver = await getDriver(resolved.storage.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage.driver, resolved.storage, getRequestOrigin(c))
     const d = driver as any
     // 优先使用驱动的直传能力
     if (typeof d.getDirectUploadInfo === "function") {
@@ -1350,7 +1377,7 @@ fsRouter.post("/multipart/init", async (c) => {
     if (resolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
-    const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).createUploadSession !== "function") {
       // 存储不支持分片：返回 data:null，前端自动回退到流式上传
       return c.json({ code: 200, message: "success", data: null })
@@ -1450,7 +1477,7 @@ fsRouter.put("/multipart/chunk", async (c) => {
       getActualPath(user, splitUploadPath(session.path).dir),
     )
     if (resolved.isVirtual) throw new Error("failed get storage: storage not found")
-    const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).uploadPart !== "function") {
       throw new Error("storage does not support chunked upload")
     }
@@ -1501,7 +1528,7 @@ fsRouter.post("/multipart/complete", async (c) => {
       getActualPath(user, splitUploadPath(session.path).dir),
     )
     if (resolved.isVirtual) throw new Error("failed get storage: storage not found")
-    const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+    const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
     if (typeof (driver as any).completeUploadSession !== "function") {
       throw new Error("storage does not support chunked upload")
     }
@@ -1577,7 +1604,7 @@ async function fetchArchiveBytes(
   const actual = getActualPath(user, virtualPath)
   const resolved = await resolvePath(actual)
   if (resolved.isVirtual) throw new Error("failed get storage: storage not found")
-  const driver = await getDriver(resolved.storage!.driver, resolved.storage)
+  const driver = await getDriver(resolved.storage!.driver, resolved.storage, getRequestOrigin(c))
   let item: any
   try {
     item = await driver.get(virtualPath, resolved.physical!)

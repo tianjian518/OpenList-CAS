@@ -1,4 +1,4 @@
-import { resolvePath, getDb, saveDb } from "../model/db"
+import { resolvePath, getDb, saveDb, getEnvCtx } from "../model/db"
 import { FileItem, StorageDriver, calcFileType } from "../driver/base"
 import { Onedrive } from "../../drivers/onedrive/driver"
 import { OnedriveAPP } from "../../drivers/onedrive_app/driver"
@@ -19,6 +19,7 @@ import { DriverIpfs } from "../../drivers/ipfs_api/driver"
 import { DriverLenovoNasShare } from "../../drivers/lenovonas_share/driver"
 import { DriverMisskey } from "../../drivers/misskey/driver"
 import { DriverDoubao } from "../../drivers/doubao/driver"
+import { DriverDoubaoNew } from "../../drivers/doubao_new/driver"
 import { DriverQuarkOpen } from "../../drivers/quark_open/driver"
 import { DriverQuarkUcTv } from "../../drivers/quark_uc_tv/driver"
 import { Driver123Open } from "../../drivers/123_open/driver"
@@ -61,6 +62,7 @@ import { AliasDriver } from "../../drivers/alias/driver"
 import { DropboxDriver } from "../../drivers/dropbox/driver"
 import { WpsDriver } from "../../drivers/wps/driver"
 import { Yun139Driver } from "../../drivers/139/driver"
+import { resetPathIndexRequestBudget } from "../../drivers/139/pathindex"
 import { MegaDriver } from "../../drivers/mega/driver"
 import { Pan115ShareDriver } from "../../drivers/115_share/driver"
 import { Pan123ShareDriver } from "../../drivers/123_share/driver"
@@ -166,9 +168,54 @@ function parseAddition(storageConfig?: any): any {
     : additionStr
 }
 
+/**
+ * 解析 strm 驱动使用的站点绝对地址（协议 + 主机，无尾斜杠）。
+ *
+ * 对齐 Go `common.GetApiUrl(ctx)`：Go 版在 strm 存储未配 `siteUrl` 时，
+ * 会回退到「当前请求的站点地址」，从而让 .strm 文件里写出**完整 URL**。
+ *
+ * 优先级：
+ *   1. 显式传入的 requestOrigin（当次请求的 origin，最准确）
+ *   2. 全局站点配置 `seed_site_url`（管理员可固化公开域名）
+ *   3. env 里的 `__requestOrigin`（中间件注入的最后一次请求 origin）
+ *
+ * 为什么必须补全：`.strm` 是独立文件，播放器/媒体库（网易爆米花、
+ * Emby、Kodi、Infuse 等）把文件内容当成一个**独立 URL** 去请求，
+ * 没有站点上下文可供推断相对路径 → 相对路径必然播放失败。
+ */
+async function resolveStrmSiteUrl(requestOrigin?: string): Promise<string> {
+  const normalize = (u: any): string =>
+    String(u || "")
+      .trim()
+      .replace(/\/+$/, "")
+
+  const direct = normalize(requestOrigin)
+  if (direct) return direct
+
+  try {
+    const { getSettings } = await import("../model/db")
+    const settings = await getSettings()
+    const configured = normalize(settings?.["seed_site_url"])
+    if (configured) return configured
+  } catch {
+    // 忽略：继续走 env 回退
+  }
+
+  try {
+    const env = getEnvCtx?.()
+    const fromEnv = normalize(env?.__requestOrigin)
+    if (fromEnv) return fromEnv
+  } catch {
+    // 忽略
+  }
+
+  return ""
+}
+
 async function createDriver(
   driverName: string,
   storageConfig?: any,
+  requestOrigin?: string,
 ): Promise<StorageDriver> {
   const normDriver = (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
   if (normDriver === "local") {
@@ -352,9 +399,16 @@ async function createDriver(
     driver = new DriverMisskey(parseAddition(storageConfig))
     await driver.init?.()
   } else if (
-    normDriver === "doubao" ||
+    // 新版豆包（飞书云空间 + DPoP 认证），配置字段与旧版不兼容，必须优先匹配
     normDriver === "doubaonew" ||
     normDriver === "doubao_new" ||
+    normDriver === "doubaonewdev"
+  ) {
+    driver = new DriverDoubaoNew(parseAddition(storageConfig))
+    await driver.init?.()
+  } else if (
+    // 旧版豆包：接口已下线，保留仅为兼容历史配置
+    normDriver === "doubao" ||
     normDriver === "doubaoshare" ||
     normDriver === "doubao_share"
   ) {
@@ -1091,7 +1145,33 @@ async function createDriver(
     await driver.init?.()
   } else if (normDriver === "strm") {
     const addition = parseAddition(storageConfig)
-    driver = new StrmDriver(addition)
+    const strmDriver = new StrmDriver(addition)
+    // 注入签名上下文：strm 在 withSign 开启时需对路径签名。
+    // 对齐 Go internal/sign：secret = setting.GetStr(conf.Token)，
+    // expire 单位小时（0 = 永不过期）。此处尽力获取，取不到则用空串（不签名）。
+    try {
+      const { getJwtSecret } = await import("../../server/middlewares")
+      const env = getEnvCtx?.()
+      const secret = await getJwtSecret({ env })
+      let linkExpirationHours = 0
+      try {
+        const db = await getDb()
+        for (const s of (db as any).settings || []) {
+          if (s.key === "link_expiration") {
+            linkExpirationHours = parseInt(s.value, 10) || 0
+            break
+          }
+        }
+      } catch {}
+      strmDriver.setSignContext(secret, linkExpirationHours)
+      // 站点绝对地址：.strm 文件内容必须是完整 URL，否则播放器无从解析。
+      // 对齐 Go strm 驱动 `getLink` 中 siteUrl 留空时走 common.GetApiUrl(ctx)。
+      const siteUrl = await resolveStrmSiteUrl(requestOrigin)
+      if (siteUrl) strmDriver.setSiteBaseUrl(siteUrl)
+    } catch (e) {
+      console.warn("[strm] failed to load sign context:", e)
+    }
+    driver = strmDriver
     await driver.init?.()
   } else if (normDriver === "chunk") {
     const addition = parseAddition(storageConfig)
@@ -1175,10 +1255,11 @@ async function createDriver(
 export async function getDriver(
   driverName: string,
   storageConfig?: any,
+  requestOrigin?: string,
 ): Promise<StorageDriver> {
   const normDriver = (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
   if (normDriver === "local") {
-    return createDriver(driverName, storageConfig)
+    return createDriver(driverName, storageConfig, requestOrigin)
   }
 
   if (!storageConfig) {
@@ -1189,15 +1270,68 @@ export async function getDriver(
 
   const cacheKey = `${storageConfig.id}_${storageConfig.modified}`
   const cached = driverCache.get(cacheKey)
-  if (cached) return cached
+  if (cached) {
+    // 缓存命中也要刷新运行时上下文。
+    //
+    // 驱动实例是跨请求长期复用的（key 为 id_modified），但 env 与
+    // storageId 属于「当次请求/部署」的上下文。若只在创建时注入一次，
+    // 则后续请求拿到的可能是首次创建时的旧值（甚至 undefined），
+    // 依赖它工作的功能（如 139 的路径索引需要落 KV）会静默失效。
+    injectRuntimeContext(cached, storageConfig, driverName, requestOrigin)
+    return cached
+  }
 
   return getOrCreateDriver(driverInitCache, cacheKey, async () => {
     const ready = driverCache.get(cacheKey)
-    if (ready) return ready
-    const driver = await createDriver(driverName, storageConfig)
+    if (ready) {
+      injectRuntimeContext(ready, storageConfig, driverName, requestOrigin)
+      return ready
+    }
+    const driver = await createDriver(driverName, storageConfig, requestOrigin)
+    injectRuntimeContext(driver, storageConfig, driverName, requestOrigin)
     setDriverCache(cacheKey, driver)
     return driver
   })
+}
+
+/**
+ * 向驱动注入运行时上下文（存储 id + 环境绑定）。
+ *
+ * 需要它的驱动通过可选方法 `setRuntimeContext` 声明；未实现该方法的驱动
+ * 直接跳过，因此对所有既有驱动无影响。
+ */
+function injectRuntimeContext(
+  driver: StorageDriver,
+  storageConfig: any,
+  driverName: string,
+  requestOrigin?: string,
+): void {
+  // strm 驱动需要「站点绝对地址」来把相对路径补全为可播放的完整 URL
+  // （对齐 Go `common.GetApiUrl(ctx)`）。origin 属于请求级上下文，
+  // 每次命中缓存都要刷新，否则冷启动后第一个请求的 origin 会被永久固化。
+  const strmTarget = driver as StorageDriver & {
+    setSiteBaseUrl?: (url: string) => void
+  }
+  if (typeof strmTarget.setSiteBaseUrl === "function" && requestOrigin) {
+    try {
+      strmTarget.setSiteBaseUrl(requestOrigin)
+    } catch (e) {
+      console.warn(`[${driverName}] failed to inject site base url:`, e)
+    }
+  }
+
+  const target = driver as StorageDriver & {
+    setRuntimeContext?: (ctx: { storageId?: any; env?: any }) => void
+  }
+  if (typeof target.setRuntimeContext !== "function") return
+  try {
+    target.setRuntimeContext({
+      storageId: storageConfig?.id,
+      env: getEnvCtx(),
+    })
+  } catch (e) {
+    console.warn(`[${driverName}] failed to inject runtime context:`, e)
+  }
 }
 
 function isCloud189Driver(driverName: string): boolean {
@@ -1288,6 +1422,31 @@ export async function flushPendingDriverState(
   driver: StorageDriver,
   requestContext?: StorageRequestContext,
 ): Promise<void> {
+  // 139：把本轮建立的路径索引落盘。
+  //
+  // 索引是"解析成本不随目录深度增长"的关键（139 接口只支持按父目录 ID
+  // 逐层查询），需要跨请求持久化。这里每请求最多产生 1 次 KV 写，
+  // 避免撞上平台的子请求配额。
+  if (isYun139Driver(driverName)) {
+    const flushState = (
+      driver as StorageDriver & { flushState?: () => Promise<void> }
+    ).flushState
+    if (typeof flushState === "function") {
+      try {
+        await flushState.call(driver)
+      } catch (e) {
+        console.warn(`[${driverName}] failed to flush path index:`, e)
+      }
+    }
+    // 释放本轮的 KV 读取预算，让下一个请求可以重新读一次索引。
+    // 不重置的话计数会跨请求累积，跑几次之后就永远读不到 KV 了。
+    try {
+      resetPathIndexRequestBudget()
+    } catch {
+      // 忽略：预算未重置只影响跨请求的索引复用，不影响功能
+    }
+  }
+
   if (!isCloud189Driver(driverName) && !isWeiyunDriver(driverName)) return
 
   const consumePendingCookie = (
@@ -1302,6 +1461,18 @@ export async function flushPendingDriverState(
     console.warn(`[${driverName}] failed to persist cookie:`, e)
   })
   await scheduleStoragePersistence(requestContext?.waitUntil, persistence)
+}
+
+/** 判断是否为 139 云盘驱动 */
+function isYun139Driver(driverName: string): boolean {
+  const n = (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+  return (
+    n === "139" ||
+    n === "139yun" ||
+    n === "caiyun" ||
+    n === "hecaiyun" ||
+    n.includes("139")
+  )
 }
 
 export async function listItems(

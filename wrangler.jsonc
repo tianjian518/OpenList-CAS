@@ -30,6 +30,14 @@
   "workers_dev": false,
   "preview_urls": false,
 
+  // 自定义域名绑定（需该域名已托管在本 CF 账号的 Zone 中）
+  "routes": [{ "pattern": "tj518.de5.net", "custom_domain": true }],
+
+  // 存储绑定：KV（免费额度最大，最通用）。
+  // 省略 id 让 wrangler 预配；若要复用账户内已有命名空间，填 id 即可。
+  // 线上实际使用：openlist-tsworkers-kv = fe69024aa86d4fb0bdfd4d312b8d59d7
+  "kv_namespaces": [{ "binding": "KV" }],
+
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS"

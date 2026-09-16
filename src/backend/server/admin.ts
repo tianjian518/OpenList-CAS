@@ -464,58 +464,20 @@ adminRouter.post("/storage/disable", async (c) => {
 })
 
 adminRouter.get("/driver/names", (c) => {
+  // 直接由 driverConfigs 派生，避免手写清单与实际注册驱动不一致。
+  // driverConfigs 在下方声明，故此处惰性求值（请求到达时模块已完成初始化）。
+  const seen = new Set<string>()
+  const data: string[] = []
+  for (const key of Object.keys(driverConfigs)) {
+    const display = driverConfigs[key]?.name || key
+    if (seen.has(display)) continue
+    seen.add(display)
+    data.push(display)
+  }
   return c.json({
     code: 200,
     message: "success",
-    data: [
-      "AliyundriveOpen",
-      "GoogleDrive",
-      "Onedrive",
-      "OnedriveAPP",
-      "Quark",
-      "123Pan",
-      "BaiduNetdisk",
-      "115Open",
-      "GitHub API",
-      "Thunder",
-      "ThunderExpert",
-      "189Cloud",
-      "WoPan",
-      "Lanzou",
-      "WebDav",
-      "S3",
-      "Doge",
-      "PikPak",
-      "Seafile",
-      "YandexDisk",
-      "Terabox",
-      "MediaTrack",
-      "Alias",
-      "Dropbox",
-      "WPS",
-      "139Yun",
-      "Mega_nz",
-      "115Share",
-      "123PanShare",
-      "AliyundriveShare",
-      "OnedriveSharelink",
-      "PikPakShare",
-      "SMB",
-      "Crypt",
-      "Virtual",
-      "AListV3",
-      "UrlTree",
-      "Strm",
-      "AzureBlob",
-      "USS",
-      "Alidoc",
-      "Emby",
-      "BunnyStorage",
-      "CloudflareImgbed",
-      "GuangYaPan",
-      "AutoIndex",
-      "ProtonDrive",
-    ],
+    data,
   })
 })
 
@@ -549,6 +511,16 @@ const COMMON_FIELDS = [
     type: "bool",
     default: "false",
     required: false,
+  },
+  {
+    // 对齐 Go 版 model.Storage.EnableSign（json: enable_sign）。
+    // 开启后该存储下所有 /d、/p 下载请求必须携带有效签名，
+    // 由 server/common.IsStorageSignEnabled + middlewares.needSign 强制校验。
+    name: "enable_sign",
+    type: "bool",
+    default: "false",
+    required: false,
+    help: "该存储的下载链接强制签名校验（对齐 Go 版 EnableSign）",
   },
   {
     name: "webdav_policy",
@@ -3814,6 +3786,100 @@ const driverConfigs: Record<string, any> = {
       only_proxy: false,
       no_cache: false,
       no_upload: false,
+      need_ms: false,
+      default_root: "/",
+    },
+  },
+  DoubaoNew: {
+    name: "DoubaoNew",
+    default_mount_path: "/doubao",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "cookie",
+        type: "text",
+        default: "",
+        required: true,
+        help: "豆包/飞书网页版完整 Cookie，必须包含 LARK_SUITE_ACCESS_TOKEN 与 LARK_SUITE_DPOP",
+      },
+      {
+        name: "app_id",
+        type: "string",
+        default: "497858",
+        required: true,
+        help: "豆包 App ID，默认 497858，无特殊情况不要改",
+      },
+      {
+        name: "dpop_key_secret",
+        type: "string",
+        default: "",
+        required: false,
+        help: "DPoP 私钥解密口令，用于自动续期 Token；留空则只能使用 Cookie 里的静态 DPoP",
+      },
+      {
+        name: "auth_client_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "业务认证 client_id，留空则跳过自动续期",
+      },
+      {
+        name: "auth_client_type",
+        type: "string",
+        default: "",
+        required: false,
+        help: "业务认证 client_type",
+      },
+      {
+        name: "auth_scope",
+        type: "string",
+        default: "",
+        required: false,
+        help: "业务认证 scope",
+      },
+      {
+        name: "auth_sdk_source",
+        type: "string",
+        default: "",
+        required: false,
+        help: "业务认证 account_sdk_source",
+      },
+      {
+        name: "auth_sdk_version",
+        type: "string",
+        default: "",
+        required: false,
+        help: "业务认证 sdk_version",
+      },
+      {
+        name: "root_folder_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "根目录 node_token，留空表示网盘根目录",
+      },
+      {
+        name: "share_link",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "是否走分享链接下载（公开存储不要开启，会变成 302）",
+      },
+      {
+        name: "ignore_jwt_check",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "是否跳过 JWT 时效检查（服务器时钟偏差时可开启）",
+      },
+    ],
+    config: {
+      name: "DoubaoNew",
+      local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      no_upload: true,
       need_ms: false,
       default_root: "/",
     },

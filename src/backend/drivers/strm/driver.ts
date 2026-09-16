@@ -6,6 +6,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
+import { signWithSecret } from "../../pkg/sign"
 import { StrmAddition } from "./types"
 
 interface RemoteTarget {
@@ -105,6 +106,7 @@ export class StrmDriver implements StorageDriver {
             const driver = await getDriver(
               resolved.storage.driver,
               resolved.storage,
+              this.siteBaseUrl || undefined,
             )
             this.remotes.set(dst, {
               driver,
@@ -125,15 +127,104 @@ export class StrmDriver implements StorageDriver {
       .join("/")
   }
 
-  private getLink(path: string): string {
+  /**
+   * 生成 strm 文件内容（要写入 .strm 的那一行 URL）。
+   *
+   * **严格对齐 Go `drivers/strm/util.go getLink`：**
+   *
+   *   func (d *Strm) getLink(ctx context.Context, path string) string {
+   *     finalPath := path
+   *     if d.EncodePath { finalPath = utils.EncodePath(path, true) }
+   *     if d.WithSign {
+   *       signPath := sign.Sign(path)                       // ← 用【原始】path 签名
+   *       finalPath = fmt.Sprintf("%s?sign=%s", finalPath, signPath)
+   *     }
+   *     pathPrefix := d.PathPrefix
+   *     if len(pathPrefix) > 0 { finalPath = stdpath.Join(pathPrefix, finalPath) }
+   *     if !strings.HasPrefix(finalPath, "/") { finalPath = "/" + finalPath }
+   *     if d.WithoutUrl { return finalPath }
+   *     apiUrl := d.SiteUrl ...
+   *     return fmt.Sprintf("%s%s", apiUrl, finalPath)
+   *   }
+   *
+   * 关键点（此前 TS 版缺失，导致 `withSign:true` 形同虚设）：
+   *   1. `withSign` 开关此前完全没被读取 —— 用户配了 true 也不生成签名；
+   *   2. 签名对象是**未编码的原始 path**（`sign.Sign(path)`），
+   *      而 URL 中展示的是**编码后**的 path，二者不可混用；
+   *   3. 签名查询串拼在 PathPrefix 之前，编码发生在签名之前。
+   *
+   * `withSign` 为 true 时使用 `sign_all` 语义：expire 取 link_expiration，
+   * 为 0 则**永不过期**（Go `NotExpired`），与非零配置一致。
+   */
+  private async getLink(path: string): Promise<string> {
     let finalPath = path
     if (this.addition.encodePath) finalPath = this.encodePath(path)
+
+    // ── 对齐 Go：WithSign → sign.Sign(path) 后拼 ?sign= ──────────────────
+    if (this.addition.withSign) {
+      const sign = await this.signPath(path)
+      finalPath = `${finalPath}?sign=${sign}`
+    }
+
     const prefix = this.addition.PathPrefix || "/d"
     finalPath = joinPath(prefix, finalPath)
     if (!finalPath.startsWith("/")) finalPath = "/" + finalPath
     if (this.addition.withoutUrl) return finalPath
-    const apiUrl = (this.addition.siteUrl || "").replace(/\/+$/, "")
+    // 对齐 Go `common.GetApiUrl(ctx)`：
+    //   apiUrl := d.SiteUrl
+    //   if len(apiUrl) > 0 { apiUrl = strings.TrimSuffix(apiUrl, "/") }
+    //   else { apiUrl = common.GetApiUrl(ctx) }   // ← 用当前请求的站点地址
+    //
+    // 此前 TS 版 siteUrl 为空时直接拼出【相对路径】（如 `/d/xxx.cas?sign=...`），
+    // 而 .strm 是独立文件，播放器/媒体库（网易爆米花、Emby、Kodi 等）无从
+    // 推断这个相对路径属于哪个站点 → 无法播放。
+    // 必须输出绝对 URL，否则 strm 形同废纸。
+    const configured = (this.addition.siteUrl || "").replace(/\/+$/, "")
+    const apiUrl = configured || this.resolvedSiteUrl()
     return `${apiUrl}${finalPath}`
+  }
+
+  /**
+   * 站点基准地址（绝对 URL 前缀）。
+   * 优先用驱动配置的 siteUrl；为空时回退到本次请求的 origin
+   * （由 op/storage 在实例化时经 setSignContext 注入）。
+   */
+  private siteBaseUrl = ""
+  setSiteBaseUrl(url: string): void {
+    this.siteBaseUrl = String(url || "").replace(/\/+$/, "")
+  }
+  private resolvedSiteUrl(): string {
+    return this.siteBaseUrl
+  }
+
+  /**
+   * 对给定路径签名，输出 Go 格式 `base64url(hmac):expire`。
+   *
+   * expire 取值对齐 Go `internal/sign.Sign`：
+   *   expire := setting.GetInt(conf.LinkExpiration, 0)
+   *   if expire == 0 { return NotExpired(data) }        // expire=0，永不过期
+   *   else { return WithDuration(data, expire * time.Hour) }
+   *
+   * 注意 Go 的 `link_expiration` 单位是**小时**（`time.Hour`），
+   * 此处保持同样语义。secret 复用站点 Token（TS 侧 getJwtSecret）。
+   */
+  private signSecret?: string
+  private linkExpirationHours?: number
+
+  setSignContext(secret?: string, linkExpirationHours?: number): void {
+    if (secret !== undefined) this.signSecret = secret
+    if (linkExpirationHours !== undefined) {
+      this.linkExpirationHours = linkExpirationHours
+    }
+  }
+
+  private async signPath(path: string): Promise<string> {
+    const secret = this.signSecret || ""
+    const hours = Number(this.linkExpirationHours) || 0
+    // Go：expire == 0 → 永不过期（时间戳写 0）
+    const expire =
+      hours > 0 ? Math.floor(Date.now() / 1000) + hours * 3600 : 0
+    return signWithSecret(secret, path, expire)
   }
 
   private ext(name: string): string {
@@ -152,7 +243,10 @@ export class StrmDriver implements StorageDriver {
     }
   }
 
-  private convert(reqPath: string, items: FileItem[]): FileItem[] {
+  private async convert(
+    reqPath: string,
+    items: FileItem[],
+  ): Promise<FileItem[]> {
     const result: FileItem[] = []
     for (const item of items) {
       if (item.is_dir) {
@@ -165,9 +259,10 @@ export class StrmDriver implements StorageDriver {
         result.push({ ...item, size: item.size })
       } else if (this.supportSuffix.has(e)) {
         const strmName = item.name.replace(/\.[^.]+$/, "") + ".strm"
+        const strmUrl = await this.getLink(originalPath)
         result.push({
           name: strmName,
-          size: new TextEncoder().encode(this.getLink(originalPath)).length,
+          size: new TextEncoder().encode(strmUrl).length,
           is_dir: false,
           modified: item.modified,
           sign: originalPath, // 保存原始路径，供 get/createReadStream 还原
@@ -217,7 +312,7 @@ export class StrmDriver implements StorageDriver {
       if (!remote) continue
       const reqPath = joinPath(dst, sub)
       const items = await this.listRemote(dst, sub)
-      for (const converted of this.convert(reqPath, items)) {
+      for (const converted of await this.convert(reqPath, items)) {
         if (!seen.has(converted.name)) {
           seen.add(converted.name)
           merged.push(converted)
@@ -285,7 +380,7 @@ export class StrmDriver implements StorageDriver {
     const items = await this.list("", dir)
     const item = items.find((i) => i.name === name)
     if (!item || !item.sign) throw new Error(`[Strm] not found: ${path}`)
-    const link = this.getLink(item.sign)
+    const link = await this.getLink(item.sign)
     const bytes = new TextEncoder().encode(link)
     return new ReadableStream<Uint8Array>({
       start(controller) {

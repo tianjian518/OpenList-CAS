@@ -90,12 +90,25 @@ async function safeProxyFetch(
 rawRouter.get("/*", async (c) => {
   await initNodeModules()
 
+  // 播放器/下载器请求 .cas、.strm 时优先走 302 直链，而不是服务端代理。
+  //
+  // 原因：
+  //   1) 流量 —— .cas 背后是 GB 级真实视频，走 /p 代理会让全部字节穿过
+  //      Cloudflare Worker（有每日请求/流量额度），代价极高；
+  //   2) 播放体验 —— 播放器需要 302 到 CDN 直链才能做分片seek。
+  //
+  // 安全性由 302 分支自带的 assertSafeUrl（SSRF 校验）保障，与其它驱动一致。
+  const isPlaylistFile = /\.(cas|strm)$/i.test(
+    decodeURIComponent(c.req.path).split("?")[0],
+  )
+
   const isProxy =
-    c.req.query("proxy") === "true" ||
-    c.req.path.startsWith("/p") ||
-    c.req.path.startsWith("/api/p") ||
-    c.req.path.startsWith("/sd") ||
-    c.req.path.startsWith("/api/sd")
+    !isPlaylistFile &&
+    (c.req.query("proxy") === "true" ||
+      c.req.path.startsWith("/p") ||
+      c.req.path.startsWith("/api/p") ||
+      c.req.path.startsWith("/sd") ||
+      c.req.path.startsWith("/api/sd"))
 
   const rawPath = c.req.path
     .replace(/^\/api\/raw/, "")
@@ -182,6 +195,14 @@ rawRouter.get("/*", async (c) => {
           const driver = await getDriver(
             resolved.storage.driver,
             resolved.storage,
+            // 注入当次请求 origin：strm 驱动据此把 .strm 内容写成绝对 URL
+            (() => {
+              try {
+                return new URL(c.req.url).origin
+              } catch {
+                return undefined
+              }
+            })(),
           )
           let fileItem
           try {
