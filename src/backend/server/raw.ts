@@ -272,6 +272,80 @@ rawRouter.get("/*", async (c) => {
             )
           }
 
+          // ── 139 CAS 播放：还原真实文件后 302 到直链 ─────────────────────
+          //
+          // 对齐 Go `server/handles/down.go` 的 Down()：
+          //
+          //   if shouldPreviewCASOnDown(c) || shouldRestoreCASOnDownload(storage, filename) {
+          //     link, file, ok, _ := linkCASPreview(c, rawPath, storage, ...)
+          //     if ok {
+          //       if common.ShouldProxy(storage, file.GetName()) { proxy(...) }
+          //       else { redirect(c, link) }     // ← 302 到真实文件直链
+          //       return
+          //     }
+          //   }
+          //
+          // `shouldPreviewCASOnDown` 在 **播放器请求时必然为真**：
+          //   有 Range 头 / Accept 含 video|audio / Sec-Fetch-Dest ∈ {video,audio}
+          //
+          // 链路：`.cas` 占位文件 → 秒传还原出真实视频（TEMP_139CAS_..._第10集.mkv）
+          //      → 取该文件的 CDN 直链 → 302 过去。
+          //
+          // 为什么必须 302 而不能由 Worker 代理：
+          //   还原后的真实文件动辄 1.5~3 GB，Worker 代理意味着**全部字节穿过
+          //   Cloudflare**，会在播放中途触发平台的流量/CPU 限制而断流，播放器
+          //   表现为「无法播放」。Go 版正是靠 302 把流量交给 CDN 才能顺畅播放。
+          //   实测：代理模式 200 + 1.57GB 由 Worker 回传；302 模式与 139cas 完全一致。
+          //
+          // 判定与还原细节在 139 驱动的 `get()`/`link()` 里实现（resolveCasPlayLink），
+          // 这里只负责在「播放器请求」这一时机把直链交给播放器。
+          {
+            const nd = normDriver
+            const is139 =
+              nd === "139" || nd === "yun139" || nd === "139yun"
+            const playerLike =
+              !!c.req.header("Range") ||
+              /video\/|audio\//i.test(c.req.header("Accept") || "") ||
+              ["video", "audio"].includes(
+                (c.req.header("Sec-Fetch-Dest") || "").toLowerCase(),
+              )
+            if (
+              is139 &&
+              playerLike &&
+              typeof (driver as any).link === "function" &&
+              /\.cas$/i.test(reqPath)
+            ) {
+              try {
+                const casLink = await (driver as any).link(
+                  reqPath,
+                  resolved.physical,
+                )
+                const casUrl = casLink?.url || ""
+                if (casUrl && casUrl !== fileItem?.raw_url) {
+                  console.log(
+                    `[rawRouter] CAS 302 for '${reqPath}' (${normDriver})`,
+                  )
+                  // 对齐 Go：Gin 的 `c.Redirect(302, url)` 会自动补上
+                  // `Content-Type: text/html; charset=utf-8`，此处显式补齐，
+                  // 保证与 139cas 的响应头逐项一致。
+                  c.header("Content-Type", "text/html; charset=utf-8")
+                  c.header(
+                    "Cache-Control",
+                    "max-age=0, no-cache, no-store, must-revalidate",
+                  )
+                  c.header("Referrer-Policy", "no-referrer")
+                  return c.body(null, 302, { Location: casUrl })
+                }
+              } catch (casErr: any) {
+                console.warn(
+                  `[rawRouter] CAS link failed for '${reqPath}':`,
+                  casErr?.message,
+                )
+                // 失败则退回代理链路，保证不劣化（至少还能播）
+              }
+            }
+          }
+
           // ── strm 驱动的 /p 代理分支（对齐 Go `(d *Strm) Link` 的分支 ③）────
           //
           // Go 版 strm 驱动 `Config.OnlyProxy = true`，于是
