@@ -152,27 +152,46 @@ export function setupRouter(app: Hono) {
     cors({
       origin: (origin, c) => {
         if (!origin) return origin
-        const env = (c as any).env || {}
+        // 支持 "*.example.com" 形式的通配子域白名单；不匹配返回 null，
+        // 由下方 host 限制兜底（不同源则一律不加入允许列表）。
+        const matchOrigin = (pattern: string, value: string): boolean => {
+          if (pattern === "*") return true
+          if (!pattern.includes("*")) return pattern === value
+          const escaped = pattern
+            .split("*")
+            .map((p: string) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+            .join("[^.]*")
+          try {
+            return new RegExp(`^${escaped}$`, "i").test(value)
+          } catch {
+            return false
+          }
+        }
         const allowedOriginsRaw =
-          env.ALLOW_URLS ||
-          (typeof process !== "undefined"
-            ? process.env?.ALLOW_URLS
-            : "") ||
+          (c as any).env?.ALLOW_URLS ||
+          (typeof process !== "undefined" ? process.env?.ALLOW_URLS : "") ||
           ""
         const allowedOrigins = allowedOriginsRaw
           .split(",")
           .map((s: string) => s.trim())
           .filter(Boolean)
+        let host = ""
+        try {
+          host = new URL(origin).host
+        } catch {
+          return null // 非法 Origin：直接不作为允许来源
+        }
         if (allowedOrigins.length > 0) {
-          return allowedOrigins.includes(origin) ? origin : null
+          // 白名单存在时，只放行同时满足「白名单匹配」且「host 校验通过」的来源。
+          const byPattern = allowedOrigins.includes("*")
+            ? true
+            : allowedOrigins.some((p: string) => matchOrigin(p, origin))
+          const byHost = allowedOrigins.includes(host)
+          return byPattern || byHost ? origin : null
         }
         // 无白名单配置时：仅同源
-        const host = c.req.header("host") || ""
-        try {
-          const u = new URL(origin)
-          if (u.host === host) return origin
-        } catch {}
-        return null
+        const reqHost = c.req.header("host") || ""
+        return host === reqHost ? origin : null
       },
       allowHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
