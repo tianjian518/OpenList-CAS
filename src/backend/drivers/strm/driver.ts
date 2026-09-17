@@ -461,7 +461,13 @@ export class StrmDriver implements StorageDriver {
     const [root, sub] = getRootAndPath(path, this.autoFlatten, this.oneKey)
 
     const dsts = this.pathMap.get(root)
-    if (!dsts) throw new Error(`[Strm] path not found: ${path}`)
+    // 对齐 Go `List`：
+    //   dsts, ok := d.pathMap[root]
+    //   if !ok { return nil, errs.ObjectNotFound }
+    // key 不存在时 Go 返回「未找到」而不是崩溃。此处返回空列表，
+    // 让上层表现为「空文件夹」，与 Go 的 ObjectNotFound 在 UI 上等价，
+    // 且不会把整个列表请求打成 500（此前会抛错，导致 /strm/任意乱路径 直接报错）。
+    if (!dsts) return []
 
     const merged: FileItem[] = []
     const seen = new Set<string>()
