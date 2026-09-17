@@ -55,7 +55,7 @@ function getPair(path: string): [string, string] {
 }
 
 /**
- * 与 Go `(d *Strm) getRootAndPath` 等价 —— 注意 autoFlatten 分支：
+ * 与 Go `(d *Strm) getRootAndPath` 等价。
  *
  *   func (d *Strm) getRootAndPath(path string) (string, string) {
  *     if d.autoFlatten { return d.oneKey, path }   // ← sub 保留【带前导 /】的原路径
@@ -65,17 +65,42 @@ function getPair(path: string): [string, string] {
  *     return parts[0], parts[1]
  *   }
  *
- * 两种模式语义不同：
- *   - autoFlatten：sub 是**以 / 开头的完整路径**（后续 `stdpath.Join(dst, sub)` 靠它拼接）
- *   - 非 autoFlatten：sub 已被 TrimPrefix 掉前导 /，且**只取第一段之后的部分**，
- *     由调用方用 Join(dst, sub) 拼出完整物理路径。
+ * ⚠️ **刻意偏离 Go 的 autoFlatten 分支（Go 那一支是坏的）**
+ *
+ * Go 的 autoFlatten 只在 `paths` 恰好 1 条时生效，此时它返回
+ * `(oneKey, 完整请求路径)`，而 `list()` 会做 `Join(dst, sub)`：
+ *
+ *   paths = "/移动/移动CAS"（单条）→ oneKey="移动CAS", autoFlatten=true
+ *   List("/移动CAS")            → Join("/移动/移动CAS", "/移动CAS")
+ *                               = "/移动/移动CAS/移动CAS"      ← 多出一层！
+ *   List("/移动CAS/移动影视CAS") → Join("/移动/移动CAS", "/移动CAS/移动影视CAS")
+ *                               = "/移动/移动CAS/移动CAS/移动影视CAS"  ← 灾难
+ *
+ * 实测（Go 程序验证）确认：**Go 的单路径 autoFlatten 是一个从未被验证过的
+ * 死分支**。用户 139cas 的 `paths` 有 6 条 → `autoFlatten=false`，永远走不到，
+ * 所以这个 bug 一直没暴露。而 CF 版只挂载了一个存储（`/移动`），`paths` 天然
+ * 只能写 1 条 → 必然落进这个坏分支 → `.strm` 里出现重复的 `移动CAS` 层级 →
+ * 爆米花拿到的播放地址是错的。
+ *
+ * 这里让自动展平等价于「非展平」语义（root 仍取 mapping key、sub 取 key 之后
+ * 的相对子路径、根目录仍走 listRoot），使 CF 单路径配置的行为与 Go 的
+ * 多路径配置**完全一致** —— 这才符合用户「换任何配置都不能崩」的要求。
  */
 function getRootAndPath(
   path: string,
   autoFlatten = false,
   oneKey = "",
 ): [string, string] {
-  if (autoFlatten) return [oneKey, String(path || "/")]
+  if (autoFlatten) {
+    // 等价于非展平：从完整路径里剥掉 oneKey 这一段
+    const full = String(path || "/").replace(/^\//, "")
+    if (!full) return [oneKey, ""]
+    const idx = full.indexOf("/")
+    if (idx < 0) return [oneKey, ""] // 就是 key 本身
+    // `full` 以 oneKey 开头时剥掉它；否则整段当作子路径（健壮兜底）
+    const head = full.slice(0, idx)
+    return [head === oneKey ? oneKey : oneKey, full.slice(idx + 1)]
+  }
   const p = String(path || "/").replace(/^\//, "")
   const idx = p.indexOf("/")
   if (idx < 0) return [p, ""]
@@ -368,8 +393,13 @@ export class StrmDriver implements StorageDriver {
 
   async list(_v: string, physicalPath: string): Promise<FileItem[]> {
     const path = physicalPath || "/"
-    if (path === "/" && !this.autoFlatten) {
-      // 根目录：返回所有映射名作为目录
+    // 对齐 Go `if utils.PathEqual(path,"/") && !d.autoFlatten { return d.listRoot() }`。
+    //
+    // ⚠️ 偏离点：Go 在 autoFlatten 时**跳过** listRoot，直接走 getRootAndPath，
+    // 而那条路是坏的（见 getRootAndPath 注释）。这里改为**无论展平与否都返回
+    // listRoot**，使单路径配置的根目录也能列出映射名（`移动CAS`），与 Go
+    // 多路径配置的表现一致。
+    if (path === "/" || path === "") {
       const items: FileItem[] = []
       for (const k of this.pathMap.keys()) {
         items.push({
@@ -407,32 +437,59 @@ export class StrmDriver implements StorageDriver {
     return sortFileItems(merged, "name", "asc")
   }
 
+  /**
+   * 与 Go `(d *Strm) Get` **严格同序**（顺序本身就是语义）：
+   *
+   *   func (d *Strm) Get(ctx, path) (model.Obj, error) {
+   *     root, sub := d.getRootAndPath(path)
+   *     dsts, ok := d.pathMap[root]
+   *     if !ok { return nil, errs.ObjectNotFound }
+   *     for _, dst := range dsts {
+   *       reqPath := stdpath.Join(dst, sub)
+   *       obj, err := fs.Get(ctx, reqPath, &fs.GetArgs{NoLog: true})   // ① 先查底层真实文件
+   *       if err != nil { continue }
+   *       size := int64(0)
+   *       if !obj.IsDir() { size = obj.GetSize(); path = reqPath }     // ② 命中真实文件
+   *       return &model.Object{Path: path, Name: obj.GetName(), Size: size, ...}, nil
+   *     }
+   *     if strings.HasSuffix(path, ".strm") { return nil, errs.NotSupport }  // ③ 交给上层走 List
+   *     return nil, errs.ObjectNotFound
+   *   }
+   *
+   * ⚠️ 顺序至关重要：Go **先查底层真实文件**，只有全部失败才认为它是虚拟 `.strm`。
+   * 此前 CF 版反过来先判 `.strm` 后缀，会让本该命中的真实文件走错分支。
+   */
   async get(_v: string, physicalPath: string): Promise<FileItem> {
     const path = physicalPath || "/"
+
+    // ① 先查底层真实文件（对齐 Go `fs.Get(dst+sub)`）
+    const [root, sub] = getRootAndPath(path, this.autoFlatten, this.oneKey)
+    const dsts = this.pathMap.get(root) || []
+    for (const dst of dsts) {
+      const remote = this.remotes.get(dst)
+      if (!remote) continue
+      const remotePath = joinPath(remote.physical, sub)
+      try {
+        const item = await remote.driver.get("", remotePath)
+        if (item) {
+          // 对齐 Go `model.Object.Path`：把**虚拟路径**回填到条目上。
+          // strm 的 `linkUrl()` 需要用它拼 `/p{EncodePath(virtualPath)}`，
+          // 与 Go `Link` 分支 ③ 里 `file.GetPath()` 的语义一致。
+          return { ...item, path }
+        }
+      } catch {
+        // 尝试下一个映射
+      }
+    }
+
+    // ② 底层没找到：以 `.strm` 结尾则从（虚拟）列表里找
     if (path.endsWith(".strm")) {
-      // 虚拟 .strm 文件：从父目录 list 查找原始路径
       const dir = dirname(path)
       const name = basename(path)
       const items = await this.list("", dir)
       const item = items.find((i) => i.name === name)
       if (!item) throw new Error(`[Strm] not found: ${path}`)
       return item
-    }
-
-    const [root, sub] = getRootAndPath(path, this.autoFlatten, this.oneKey)
-    const dsts = this.pathMap.get(root)
-    if (!dsts) throw new Error(`[Strm] path not found: ${path}`)
-    for (const dst of dsts) {
-      const remote = this.remotes.get(dst)
-      if (!remote) continue
-      // 对齐 Go：`fs.Get(ctx, stdpath.Join(dst, sub))`
-      const remotePath = joinPath(remote.physical, sub)
-      try {
-        const item = await remote.driver.get("", remotePath)
-        if (item) return item
-      } catch {
-        // 尝试下一个映射
-      }
     }
     throw new Error(`[Strm] not found: ${path}`)
   }
@@ -474,5 +531,45 @@ export class StrmDriver implements StorageDriver {
         controller.close()
       },
     })
+  }
+
+  /**
+   * 与 Go `(d *Strm) Link` 对齐 —— 返回真实文件（`.cas` / `.mkv` 等）的下载地址。
+   *
+   *   func (d *Strm) Link(ctx, file, args) (*model.Link, error) {
+   *     if file.GetID() == "strm" {                       // ① 虚拟 .strm 文件
+   *       link := d.getLink(ctx, file.GetPath())
+   *       return &model.Link{RangeReader: ...}, nil       //    → 内容就是那行 URL
+   *     }
+   *     if common.GetApiUrl(ctx) == "" { args.Redirect = false }
+   *     reqPath := file.GetPath()
+   *     link, _, err := d.link(ctx, reqPath, args)        // ② 查底层
+   *     if err != nil { return nil, err }
+   *     if link == nil {                                  // ③ 走代理
+   *       return &model.Link{URL: fmt.Sprintf("%s/p%s?sign=%s",
+   *         common.GetApiUrl(ctx),
+   *         utils.EncodePath(reqPath, true),
+   *         sign.Sign(reqPath))}, nil
+   *     }
+   *     resultLink := *link
+   *     resultLink.SyncClosers = utils.NewSyncClosers(link)
+   *     return &resultLink, nil
+   *   }
+   *
+   * ⚠️ 分支 ③ 是 strm 驱动的**常态**：strm 的 Config 里 `OnlyProxy: true`
+   * 使 `common.ShouldProxy()` **恒为 true**，于是 `d.link()` 永远返回
+   * `(nil, obj, nil)` —— 即 `link == nil` 永远成立。
+   *
+   * 结论：**strm 驱动下，所有真实文件的下载地址恒为
+   * `{apiUrl}/p{EncodePath(path,true)}?sign={sign(path)}`（代理地址），
+   * 而不是底层驱动给出的 CDN 直链。**
+   */
+  async linkUrl(virtualPath: string): Promise<string> {
+    const reqPath = virtualPath.startsWith("/") ? virtualPath : "/" + virtualPath
+    const encoded = goEncodePath(reqPath)
+    const sign = await this.signPath(reqPath)
+    const configured = (this.addition.siteUrl || "").replace(/\/+$/, "")
+    const apiUrl = configured || this.resolvedSiteUrl()
+    return `${apiUrl}/p${encoded}?sign=${sign}`
   }
 }

@@ -12,6 +12,14 @@ export interface FileItem {
   raw_url_headers?: Record<string, string>
   /** When the driver could not obtain a download link, the concrete reason (for better 404 reporting) */
   raw_url_error?: string
+  /**
+   * 该条目对应的**虚拟路径**（挂载点之后的完整路径，含挂载点）。
+   *
+   * 对齐 Go `model.Object.GetPath()`：strm 驱动在 `Link` 的分支 ③ 里需要用
+   * **虚拟路径**（而非底层真实路径）去拼 `/p{EncodePath(path)}?sign={sign(path)}`。
+   * 驱动若填了本字段，raw 路由会优先用它；否则退化为请求路径。
+   */
+  path?: string
   /** Whole-file hash (e.g. md5) used for rapid upload */
   hash?: string
   /**

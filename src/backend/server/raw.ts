@@ -145,9 +145,17 @@ rawRouter.get("/*", async (c) => {
   //   2) 播放体验 —— 播放器需要 302 到 CDN 直链才能做分片seek。
   //
   // 安全性由 302 分支自带的 assertSafeUrl（SSRF 校验）保障，与其它驱动一致。
+  //
+  // ⚠️ 例外：**strm 驱动**。其 Config 里 `OnlyProxy: true`，Go 侧
+  // `ShouldProxy()` 恒为 true，真实文件恒走 `/p` 代理。所以对 strm 不做
+  // 302 到 CDN 的短路，而是交给下面的 strm 专用分支生成 `/p` 代理地址。
   const isPlaylistFile = /\.(cas|strm)$/i.test(
     decodeURIComponent(c.req.path).split("?")[0],
   )
+
+  // 本次请求是否**已经**是从 `/p` / `/d` 进来的（服务端代理端点）。
+  // 由 strm 的 `linkUrl()` 生成的 `/p...` 地址再次回到本路由时就命中这里。
+  const isProxyEndpoint = /^\/(api\/)?(p|d|sd)(\/|$)/.test(c.req.path)
 
   const isProxy =
     !isPlaylistFile &&
@@ -264,10 +272,108 @@ rawRouter.get("/*", async (c) => {
             )
           }
 
+          // ── strm 驱动的 /p 代理分支（对齐 Go `(d *Strm) Link` 的分支 ③）────
+          //
+          // Go 版 strm 驱动 `Config.OnlyProxy = true`，于是
+          // `common.ShouldProxy()` 恒为 true，`d.link()` 永远返回 `(nil, obj, nil)`，
+          // 使 `Link` 走分支 ③：
+          //
+          //   return &model.Link{URL: fmt.Sprintf("%s/p%s?sign=%s",
+          //     common.GetApiUrl(ctx), utils.EncodePath(reqPath, true),
+          //     sign.Sign(reqPath))}, nil
+          //
+          // 即：**strm 下的真实文件（.cas 等）拿到的下载地址恒为
+          // `{apiUrl}/p{EncodePath(virtualPath,true)}?sign={sign(virtualPath)}`**，
+          // 而不是底层驱动给出的 CDN 直链。`.strm` 里写的 `/d/...` 也一样，
+          // 服务端再改写成 `/p` 代理 —— 这是驱动与前端的契约。
+          //
+          // 139cas 正是靠这条链路才能被网易爆米花播放。CF 版此前对 strm
+          // 直接 302 到 CDN 直链，与 Go 行为不一致。
+          if (fileItem && fileItem.raw_url && normDriver === "strm") {
+            const virtualPath = fileItem.path || reqPath
+            try {
+              const proxied = await (driver as any).linkUrl(virtualPath)
+              if (proxied) {
+                // 防止自指死循环：若生成的代理地址指向的就是本次请求，
+                // 说明底层 get 没能解析出真实条目，直接放弃代理分支。
+                const selfUrl = (() => {
+                  try {
+                    return new URL(c.req.url).toString()
+                  } catch {
+                    return ""
+                  }
+                })()
+                if (proxied === selfUrl) {
+                  console.warn(
+                    `[rawRouter] strm linkUrl self-reference for '${virtualPath}', skip proxy`,
+                  )
+                } else {
+                  console.log(
+                    `[rawRouter] strm /p proxy for '${virtualPath}' -> ${proxied}`,
+                  )
+                  c.header(
+                    "Cache-Control",
+                    "max-age=0, no-cache, no-store, must-revalidate",
+                  )
+                  c.header("Referrer-Policy", "no-referrer")
+                  return c.body(null, 302, { Location: proxied })
+                }
+              }
+            } catch (e: any) {
+              console.warn(
+                `[rawRouter] strm linkUrl failed for '${virtualPath}':`,
+                e?.message,
+              )
+            }
+          }
+
           if (fileItem && fileItem.raw_url) {
-            // WebDAV 等需要认证的驱动：强制使用代理模式，避免重定向导致认证丢失
+            // 对齐 Go `common.ShouldProxy(storage, filename)`：
+            //   if storage.Config().MustProxy() || storage.GetStorage().WebProxy { return true }
+            //   if utils.SliceContains(conf.ProxyTypes, ext) { return true }
+            //   return false
+            //
+            // 其中 `MustProxy() = OnlyProxy || NoLinkURL`。**Strm 驱动的
+            // Config 同时开了 `OnlyProxy: true` 和 `NoLinkURL: true`**，
+            // 于是 ShouldProxy 恒为 true —— Go 侧 strm 下的真实文件
+            // （.cas 等）永远走 `/p` 服务端代理，**绝不会 302 到 CDN 直链**。
+            //
+            // 这是本驱动与前端的契约：`.strm` 里写的是 `/d/...`，
+            // 播放器拿到后请求 `/d`，服务端再改写成 `/p` 代理。
+            // 此前 CF 版没有 MustProxy 概念，对 strm 直接 302 到 CDN，
+            // 与 Go 行为不一致。
+            const mustProxyDrivers = new Set([
+              "virtual",
+              "crypt",
+              "chunk",
+              "smb",
+              "ftp",
+              "sftp",
+              "protondrive",
+              "halalcloud",
+              "mega",
+            ])
+            // 来自 `/p` / `/d` 端点的请求，本身就是「要求代理」的语义
+            // （Go：`/p` 走 `ProxyHandler`，`/d` 在 ShouldProxy 为真时也转代理）。
+            // 典型场景：strm 的 `linkUrl()` 生成 `/p...`，请求回到本路由时
+            // 底层已是 139Yun 这类普通驱动，必须继续代理而不能 302 回 CDN。
+            const driverNeedsProxy =
+              isProxyEndpoint ||
+              mustProxyDrivers.has(normDriver) ||
+              (() => {
+                try {
+                  const ad =
+                    typeof resolved.storage.addition === "string"
+                      ? JSON.parse(resolved.storage.addition)
+                      : resolved.storage.addition
+                  return !!ad?.web_proxy
+                } catch {
+                  return false
+                }
+              })()
             const needsProxy =
               isProxy ||
+              driverNeedsProxy ||
               normDriver === "webdav" ||
               normDriver === "sharepoint" ||
               normDriver === "onedrive" ||
