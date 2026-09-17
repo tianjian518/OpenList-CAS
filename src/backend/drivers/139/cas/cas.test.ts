@@ -184,19 +184,29 @@ test("buildPartInfos 小文件单分片", () => {
   assert.deepEqual(parts[0], { partNumber: 1, partSize: 1024 })
 })
 
-test("buildPartInfos 十分片边界", () => {
-  const ten = 10 * 1024 * 1024
-  assert.equal(buildPartInfos(ten).length, 1)
-  assert.equal(buildPartInfos(ten + 1).length, 2)
+test("buildPartInfos 单分片边界（100MB）", () => {
+  // SLICE_SIZE = 100MB：恰好 100MB 是 1 片，多 1 字节就要 2 片
+  const slice = 100 * 1024 * 1024
+  assert.equal(buildPartInfos(slice).length, 1)
+  assert.equal(buildPartInfos(slice + 1).length, 2)
 })
 
 test("buildPartInfos 分片号递增且总和不超 size", () => {
-  const size = 25 * 1024 * 1024 + 777
+  // 250MB+777B：100 + 100 + 50MB+777 → 3 片
+  const size = 250 * 1024 * 1024 + 777
   const parts = buildPartInfos(size)
   assert.equal(parts.length, 3)
   parts.forEach((p, i) => assert.equal(p.partNumber, i + 1))
   const total = parts.reduce((s, p) => s + p.partSize, 0)
   assert.equal(total, size)
+})
+
+test("buildPartInfos 超过 30GB 阈值改用 512MB 大分片", () => {
+  // LARGE_FILE_THRESHOLD = 30GB；阈值内用 100MB，超过后用 512MB
+  const under = 30 * 1024 * 1024 * 1024 // 恰好 30GB，仍属普通分片
+  const over = 40 * 1024 * 1024 * 1024 // 40GB → 512MB 分片
+  assert.equal(buildPartInfos(under)[0].partSize, 100 * 1024 * 1024)
+  assert.equal(buildPartInfos(over)[0].partSize, 512 * 1024 * 1024)
 })
 
 test("buildPartInfos 空文件也返回一个分片", () => {
@@ -206,9 +216,12 @@ test("buildPartInfos 空文件也返回一个分片", () => {
 })
 
 test("buildPartInfos 分片数封顶 100", () => {
-  // 100 片 × 10MB = 1000MB，超出的部分不再声明
-  const parts = buildPartInfos(2000 * 1024 * 1024)
-  assert.equal(parts.length, 100)
+  // 2GB → ceil(2GB / 100MB) = 21 片（未封顶）
+  assert.equal(buildPartInfos(2 * 1024 * 1024 * 1024).length, 21)
+  // 10GB → 102 片会被截到上限 100
+  assert.equal(buildPartInfos(10 * 1024 * 1024 * 1024).length, 100)
+  // 再大也不会超过上限（云端限制 MAX_PART_INFOS = 100）
+  assert.equal(buildPartInfos(20 * 1024 * 1024 * 1024).length, 100)
 })
 
 /* --------------------- 定时清扫（sweepTempFilesAll） --------------------- */

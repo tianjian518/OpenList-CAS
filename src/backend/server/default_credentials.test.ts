@@ -8,6 +8,7 @@ import {
   hashPasswordSHA256,
 } from "./auth"
 import { isHex64 } from "../pkg/password"
+import { verifyUserPassword as verifyPkgUserPassword } from "../pkg/password"
 import { userRouter } from "./user"
 
 const env: any = {}
@@ -126,6 +127,10 @@ test("Security(F-11): user/create without a password gets a random one, not 1234
   const created = db.users.find((u: any) => u.username === "newuser")
   assert.ok(isHex64(created.password), "stored value must be a 64-hex hash")
   assert.ok(created.salt, "stored user must carry a per-user salt")
+  // 注意签名是 verifyUserPassword(用户对象, 明文) —— 与本路由/登录接口的
+  // 真实调用约定一致（server/user.ts:301、server/auth.ts:451）。
+  // pkg/password.ts 里另有一个同名函数，签名是 (明文, 用户对象)，
+  // 两者极易混淆；这里同时覆盖，防止再次被参数顺序带偏。
   assert.equal(
     await verifyUserPassword(created, json.data.password),
     true,
@@ -135,5 +140,10 @@ test("Security(F-11): user/create without a password gets a random one, not 1234
     await verifyUserPassword(created, "123456"),
     false,
     "the stored hash must not be of the well-known 123456",
+  )
+  assert.equal(
+    await verifyPkgUserPassword(json.data.password, created),
+    true,
+    "pkg/password.ts verifyUserPassword(plain, user) must agree",
   )
 })

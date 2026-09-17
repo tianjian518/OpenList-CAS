@@ -75,25 +75,87 @@ export async function setUserPassword(
 }
 
 /**
- * 验证密码（兼容历史单层 sha256，推荐存储为双层）
- * @param plain 明文密码（或经过 staticHash 的前端哈希值）
+ * 判断传入值是否就是「已存储的那个哈希」。
+ *
+ * 这是一条**纵向**防线：挡住「把存储哈希本身当口令提交」的自证攻击。
+ * 在无盐（历史单层）格式下 `stored === stored` 恒成立，会直接放行；
+ * 因此凡与存储值逐字节相同、且形态是 64 位 hex 的输入，一律不认。
+ */
+function isStoredHashReplay(
+  candidate: string,
+  stored: string,
+): boolean {
+  return isHex64(candidate) && candidate.toLowerCase() === stored.toLowerCase()
+}
+
+/**
+ * 验证密码（兼容历史单层 sha256，推荐存储为双层）。
+ *
+ * @param plain 明文密码（**严格是明文**）
  * @param user  含 password + salt 字段的用户对象
+ *
+ * ⚠️ 安全约束（勿改）：本函数是「用明文登录」路径的判定核心，服务于
+ * `/login`、WebDAV Basic Auth、改密时的旧密码校验。**绝不能**把
+ * `isHex64(input)` 当成「输入已是 staticHash」的理由而跳过 `staticHash()`：
+ *
+ *   - 网页端每次登录都会把 `staticHash(pwd)` 发到 `/login/hash`，该值会
+ *     出现在浏览器内存与网络面板里，属于**半公开**值；
+ *   - 一旦明文函数接受它，它就成了口令等价物 —— 拿到它即可登录，
+ *     无需明文，且绕过前端所有密码强度/校验逻辑。
+ *
+ * 需要支持「客户端已做静态哈希」的调用点，必须**显式**走另一条路径
+ * （`verifyUserStaticHash` / `verifyUserStaticHashValue`），
+ * 不允许在明文函数里靠输入形态猜测。
  */
 export async function verifyUserPassword(
   plain: string,
   user: { password: string; salt?: string },
 ): Promise<boolean> {
-  if (!user.password) return false
+  const stored = String(user?.password || "").trim()
+  if (!stored) return false
+
+  // 旁路防护：把存储哈希本身当口令提交，直接拒绝
+  if (isStoredHashReplay(String(plain || ""), stored)) return false
+
+  // 输入一律按「明文」处理；staticHash 与 saltedHash 由本函数内部完成
+  const staticHex = await staticHash(String(plain ?? ""))
   if (user.salt) {
-    // 双层：先判断 plain 是否已经是 staticHash（前端哈希登录），
-    // 再判断是否是明文（直接登录）。
-    const staticHex = isHex64(plain) ? plain : await staticHash(plain)
     const expected = await saltedHash(staticHex, user.salt)
-    return expected === user.password
+    return expected.toLowerCase() === stored.toLowerCase()
   }
   // 历史单层：password == staticHash(plain)
-  const staticHex = isHex64(plain) ? plain : await staticHash(plain)
-  return staticHex === user.password
+  return staticHex.toLowerCase() === stored.toLowerCase()
+}
+
+/**
+ * 验证「客户端已做过 staticHash 的值」（Go 前端 `/login/hash` 语义）。
+ *
+ * 与 `verifyUserPassword` 的区别只在于**输入的语义被显式声明为静态哈希**，
+ * 因此这里不做 `staticHash(input)` —— 但仍然拒绝「提交存储哈希」的旁路。
+ *
+ * @param inputStatic 已经是 staticHash(pwd) 的 64 位 hex
+ * @param user        含 password + salt 字段的用户对象
+ */
+export async function verifyUserStaticHashValue(
+  inputStatic: string,
+  user: { password: string; salt?: string },
+): Promise<boolean> {
+  const stored = String(user?.password || "").trim().toLowerCase()
+  const input = String(inputStatic || "").trim().toLowerCase()
+  if (!stored) return false
+  if (!isHex64(input)) return false
+  // 兼容历史单层格式：此时 stored 本身就是 staticHash，不带盐，
+  // 输入的静态哈希与 stored 相等即为通过 —— 这是既有数据的正常登录路径，
+  // 不属于「存储哈希重放」（那条防线针对的是**双层**格式：
+  // 提交存储值进不了 `saltedHash(·, salt) === stored` 这一等式）。
+  if (!isHex64(stored)) return false
+  if (user.salt && isStoredHashReplay(input, stored)) return false
+
+  if (user.salt) {
+    const expected = await saltedHash(input, String(user.salt))
+    return expected.toLowerCase() === stored.toLowerCase()
+  }
+  return input === stored.toLowerCase()
 }
 
 // ---- 工具函数（与存储无关） ----

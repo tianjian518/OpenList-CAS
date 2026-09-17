@@ -447,8 +447,20 @@ authRouter.post("/login", async (c) => {
   )
 
   if (matchedUser) {
-    // 明文登录：服务端先 StaticHash，再比对存储哈希（兼容单层/双层/bcrypt 遗留）
-    const isPasswordValid = await verifyUserPassword(matchedUser, rawPassword)
+    // 明文登录：服务端先 StaticHash，再比对存储哈希（兼容单层/双层/bcrypt 遗留）。
+    //
+    // 兼容层：Go 前端在部分登录路径上直接把 `staticHash(pwd)` 传给 /login
+    // （而不是 /login/hash）。两者必须都接受，否则前端会「密码明明对却登不进」。
+    // 传入值恰好是 64 位 hex 时，按「静态哈希」语义再试一次。
+    //
+    // ⚠️ 这里**不能**直接放宽 `verifyUserPassword` 去接受 hex 输入：
+    // 那个函数同时服务于 WebDAV Basic Auth 与改密校验，把「hex 即已哈希」
+    // 的猜测下沉进去，会让 64 位 hex 成为可绕过的口令形态。判定留在
+    // 调用点、按接口语义显式表达，才不会互相污染。
+    const isPasswordValid =
+      (await verifyUserPassword(matchedUser, rawPassword)) ||
+      (isHex64(rawPassword.trim()) &&
+        (await verifyUserStaticHash(matchedUser, rawPassword.trim())))
 
     if (isPasswordValid) {
       // 遗留格式（bcrypt / 无盐单层 SHA256）登录成功后自动升级为 Go 双层哈希

@@ -804,6 +804,35 @@ let memoryDb: any = null
 let globalEnvCtx: any = null
 
 /**
+ * 事件循环级「权威环境对象」。
+ *
+ * ## 为什么必须有它（真实 BUG，线上 SEV2）
+ *
+ * 存储后端缓存（见下方 dbCacheKey）已按「后端身份」分槽，但**模块级的
+ * memoryDb 只有一份**。只要同一次请求里出现两个 env 对象（非常常见：
+ * `{ ...c.env, ADMIN_PASS }`、`{ ...c.env }` 之类为了补个变量而展开），
+ * 就会出现读写分裂：
+ *
+ *   1. 请求 A 用 `{...env, ADMIN_PASS}` 调 getOrInitUsers() → getDb 读到
+ *      持久化的**旧快照**（administrator 还是空的）并覆盖 memoryDb；
+ *   2. 随后 `setUserPassword(admin)` + `saveDb(db, env)` 用**原始 env** 落盘；
+ *   3. 同一次请求再调 getDb(env)（原始对象）→ 命中另一个缓存槽、
+ *      需要重新 load，读回的仍是旧快照 → 刚设置的密码被打回。
+ *
+ * 表现为「密码设了不生效 / 配置改完又自己变回去」，且不报任何错。
+ *
+ * 对策：**同一次「请求」内只认一个权威 env 对象**。凡是满足
+ * 「同一微任务批次（同一 tick）」的调用，一律复用第一个被设置的 env，
+ * 由此保证：
+ *   - 所有 getDb/saveDb 命中同一个 dbCache 槽与同一份 memoryDb；
+ *   - 不会因为 `{...env}` 包装而重新 load 出旧快照。
+ *
+ * 跨 tick（真正的另一个请求、setTimeout、下一个事件循环）时自动失效，
+ * 因此不会把一个请求的环境串给另一个请求。
+ */
+let tickEnvCtx: any = null
+
+/**
  * 在请求处理开始时注入当前环境的持久化后端上下文。
  * CF Workers 每个实例的模块级 globalEnvCtx 初始为 null，且请求会被负载均衡到
  * 不同实例——若不设置，getDb()/saveDb() 会退回内存模式，导致配置
@@ -812,8 +841,48 @@ let globalEnvCtx: any = null
 export function setEnvCtx(env: any) {
   if (env) {
     globalEnvCtx = env
+    adoptEnvForTick(env)
     setJsonEnvCtx(env)
   }
+}
+
+/**
+ * 见 tickEnvCtx 的说明：同一微任务批次内统一使用首个 env 对象。
+ */
+function adoptEnvForTick(env: any): any {
+  if (!tickEnvCtx) {
+    tickEnvCtx = env
+    // 用 microtask 排队把「批次边界」定下来：本批所有同步/微任务链上的调用
+    // 共享同一个 tickEnvCtx，队列跑完之后（即真正的下一个事件循环）释放。
+    Promise.resolve().then(() => {
+      tickEnvCtx = null
+    })
+  }
+  return tickEnvCtx
+}
+
+/**
+ * 解析本次调用应当使用的权威 env。
+ *
+ * 规则：同一微任务批次内，第一个被看到的 env 胜出；后续传入的任何 env
+ * （尤其 `{...env}` 展开出来的新对象）都不再改变存储上下文，
+ * 避免「A 环境写、B 环境读」造成的内存/持久化分裂。
+ */
+function resolveActiveEnv(envCtx?: any): any {
+  if (tickEnvCtx) return tickEnvCtx
+  if (envCtx) return adoptEnvForTick(envCtx)
+  return globalEnvCtx
+}
+
+/**
+ * 读取当前请求的 env 上下文（由 setEnvCtx 注入）。
+ *
+ * 供上层在「拿不到显式 env 参数」的深层调用中取回环境绑定，例如
+ * op/storage.ts 里构造驱动、注入 STRM 签名密钥、以及 setRuntimeContext。
+ * 取不到时返回 null（调用方需自行回退），不要抛错——它在多处属于尽力而为的路径。
+ */
+export function getEnvCtx(): any {
+  return tickEnvCtx || globalEnvCtx
 }
 
 // 已知的旧默认值 → 当前默认值迁移表。
@@ -964,10 +1033,56 @@ const ensureDefaultMetas = (db: any) => {
  *
  * TODO: threading `db` down from the handler gives exact per-request scope,
  * but touches all ~83 call sites.
+ *
+ * ## 缓存键为什么不能直接用 env 对象（重要）
+ * 曾经 `dbCache` 直接以 `envCtx` 对象作 WeakMap 键。这有个隐蔽的坑：
+ * 调用方只要写成 `{ ...env }` 之类的**展开**（很常见，比如在 env 上补一个
+ * ADMIN_PASS 再往下传），就会产生一个**新的对象标识**，于是：
+ *   1. 缓存 miss → 重新 `backend.load()` 读一遍存储；
+ *   2. 读回来的往往是**异步落盘前的旧快照**，直接覆盖掉内存里 `memoryDb`，
+ *      把刚 `saveDb()` 写入的改动冲掉。
+ * 现象就是「配置改了又自己变回去」——注释下方提到的 SEV2 就是这么来的。
+ *
+ * 因此改用「后端身份」做键：只要指向同一个存储后端，无论 env 对象是否被
+ * 重新包装，都命中同一个缓存槽。`saveDb` 也据此刷新缓存。
  */
 const DB_CACHE_TTL_MS = 1000
-const dbCache = new WeakMap<object, { ts: number; db: any }>()
-const dbInflight = new WeakMap<object, Promise<any>>()
+const dbCache = new Map<string, { ts: number; db: any }>()
+const dbInflight = new Map<string, Promise<any>>()
+
+/**
+ * 计算缓存键：`后端名 + 绑定存在性`。
+ *
+ * 关键是**不含 env 对象本身**——只要指向同一套绑定，就应命中同一个缓存槽，
+ * 这样 `{ ...env }` 包装出来的新对象不会造成缓存 miss 而重读旧快照。
+ * 反过来，不同部署（如一个用 KV、一个用 D1）的绑定组合不同，键自然也不同。
+ */
+const CACHE_BINDINGS = [
+  "KV",
+  "DB",
+  "BUCKET",
+  "OPENCAS_KV",
+  "OPENCAS_D1",
+  "OPENCAS_R2",
+  "OPENCAS_DO",
+  "MY_KV",
+  "MY_DB",
+]
+
+async function dbCacheKey(activeEnv: any): Promise<string> {
+  try {
+    const backend = await getStoreBackend(activeEnv)
+    const name = backend?.name || "unknown"
+    if (!activeEnv) return `${name}::none`
+    const marks: string[] = []
+    for (const k of CACHE_BINDINGS) {
+      if (activeEnv[k]) marks.push(k)
+    }
+    return `${name}::${marks.join(",") || "default"}`
+  } catch {
+    return "unknown::default"
+  }
+}
 
 const loadDb = async (envCtx?: any) => {
   if (envCtx) {
@@ -978,7 +1093,7 @@ const loadDb = async (envCtx?: any) => {
   // 注意：envCtx 可能为空（如 resolvePath 等内部调用 getDb() 不传 env）。
   // 此时必须回退到请求级 globalEnvCtx，否则 readDriver 读不到 DB_DRIVER、
   // getD1 读不到 DB binding，会错误回退到 json 后端读到旧的 KV 数据。
-  const activeEnv = envCtx || globalEnvCtx
+  const activeEnv = resolveActiveEnv(envCtx)
   const backend = await getStoreBackend(activeEnv)
   try {
     const persisted = await backend.load(activeEnv)
@@ -1015,29 +1130,32 @@ const loadDb = async (envCtx?: any) => {
 }
 
 export const getDb = async (envCtx?: any) => {
-  if (envCtx) {
-    globalEnvCtx = envCtx
-  }
-  // envCtx is the cache key — without it there is nothing safe to scope to.
-  if (!envCtx) return loadDb(envCtx)
+  // 见 tickEnvCtx 说明：批次内以首个 env 为准，`{...env}` 包装不会另开存储上下文。
+  const activeEnv = resolveActiveEnv(envCtx)
+  if (activeEnv && globalEnvCtx !== activeEnv) globalEnvCtx = activeEnv
+  if (!activeEnv) return loadDb(envCtx)
+
+  // 缓存键按「后端身份」而非 env 对象标识计算，这样 { ...env } 之类的
+  // 展开包装也能命中同一份缓存，不会重新读盘把内存改动冲掉。
+  const key = await dbCacheKey(activeEnv)
 
   // 1) Concurrent de-duplication: concurrent callers share a single KV read.
-  const pending = dbInflight.get(envCtx)
+  const pending = dbInflight.get(key)
   if (pending) return pending
 
   // 2) Short-TTL memoization: sequential calls in one request reuse the result.
-  const hit = dbCache.get(envCtx)
+  const hit = dbCache.get(key)
   if (hit && Date.now() - hit.ts < DB_CACHE_TTL_MS) return hit.db
 
   const promise = loadDb(envCtx)
     .then((db) => {
-      dbCache.set(envCtx, { ts: Date.now(), db })
+      dbCache.set(key, { ts: Date.now(), db })
       return db
     })
     .finally(() => {
-      dbInflight.delete(envCtx)
+      dbInflight.delete(key)
     })
-  dbInflight.set(envCtx, promise)
+  dbInflight.set(key, promise)
   return promise
 }
 
@@ -1421,15 +1539,25 @@ async function unsealDb(data: any, key: string | null): Promise<void> {
 }
 
 export const saveDb = async (data: any, envCtx?: any): Promise<boolean> => {
-  if (envCtx) {
-    globalEnvCtx = envCtx
-  }
+  // 与 getDb 同源：写入必须落在「本批次权威 env」指向的后端与缓存槽上，
+  // 否则 { ...env } 写法会造成「A 环境写、B 环境读」的分裂。
+  const activeEnv = resolveActiveEnv(envCtx)
+  if (activeEnv && globalEnvCtx !== activeEnv) globalEnvCtx = activeEnv
   memoryDb = data
   // Refresh the request cache so any getDb() later in this request observes
   // the write rather than a pre-write snapshot.
-  if (envCtx) dbCache.set(envCtx, { ts: Date.now(), db: data })
-
-  const activeEnv = envCtx || globalEnvCtx
+  //
+  // 键必须与 getDb() 用同一套规则（后端身份）计算：否则 saveDb(c.env) 之后
+  // 用 GET 时可能命中另一个缓存槽，读到落盘前的旧快照，把本次写入冲掉——
+  // 这正是「配置改完又变回去」的成因。写入时顺带清掉同后端的在途 promise，
+  // 避免并发的 getDb() 用旧 load 结果覆盖。
+  try {
+    const key = await dbCacheKey(activeEnv)
+    dbCache.set(key, { ts: Date.now(), db: data })
+    dbInflight.delete(key)
+  } catch {
+    // 键算不出来时不影响主流程（持久化仍会继续）
+  }
   const backend = await getStoreBackend(activeEnv)
   const configured = backend.isConfigured
     ? await backend.isConfigured(activeEnv)

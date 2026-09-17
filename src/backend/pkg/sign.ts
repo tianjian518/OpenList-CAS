@@ -228,7 +228,8 @@ export async function getSignExpiresIn(c: any): Promise<number> {
     const db = await getDb(c?.env)
     // link_expiration 单位是【小时】（对齐 Go time.Hour）
     const hours = getLinkExpirationHours(db)
-    if (hours > 0) return hours * 3600
+    // 0 才是「未配置 / 永不过期」；负数照样透传，让签名立即失效
+    if (hours !== 0) return hours * 3600
   } catch {}
   // 未配置 → 永不过期（Go NotExpired 语义），而不是默认 24h
   return 0
@@ -237,12 +238,18 @@ export async function getSignExpiresIn(c: any): Promise<number> {
 /**
  * 读取站点 link_expiration（小时）。返回 0 表示未配置（= 永不过期）。
  * 同时导出给 strm 驱动注入签名上下文时复用。
+ *
+ * 注意保留负数的**原值**而不是归一成 0：
+ * 负数在 Go 里代表「已过期」（时间戳落在过去），若在这里当 0 处理，
+ * 管理员误填 `link_expiration = -1` 会让链接变成**永不过期**——
+ * 与配置意图（限制有效期）完全相反，属于安全隐患。
  */
 export function getLinkExpirationHours(db: any): number {
   try {
     for (const s of db?.settings || []) {
       if (s.key === "link_expiration") {
-        return parseInt(s.value, 10) || 0
+        const n = parseInt(s.value, 10)
+        return Number.isFinite(n) ? n : 0
       }
     }
   } catch {}
@@ -262,7 +269,8 @@ export function getLinkExpirationHours(db: any): number {
  * 输出形如 `Xy3..._a=:1712345678`。
  * expire === 0 表示永不过期（Go `NotExpired`）。
  *
- * @param expiresIn 有效期（秒）。传 0 表示永不过期。
+ * @param expiresIn 有效期（秒）。传 0 表示永不过期；**负数表示已过期**
+ *                  （对齐 Go：负数时间戳落在过去，NotExpired 判定为已失效）。
  */
 export async function signDownloadPathRaw(
   c: any,
@@ -271,7 +279,9 @@ export async function signDownloadPathRaw(
 ): Promise<string> {
   const secret = await getJwtSecret(c)
   const expire =
-    expiresIn > 0 ? Math.floor(Date.now() / 1000) + expiresIn : 0
+    expiresIn === 0
+      ? 0 // 0 = 永不过期（Go NotExpired 语义）
+      : Math.floor(Date.now() / 1000) + expiresIn
   return signWithSecret(secret, virtualPath, expire)
 }
 

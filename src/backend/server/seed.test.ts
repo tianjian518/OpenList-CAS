@@ -84,10 +84,21 @@ test("torrent codec writes BT v1 info plus OpenList and CAS extensions", async (
 test("CAS codec matches casmeta base64 JSON field names", async () => {
   const bytes = await encodeCas(casSeed())
   const payload = JSON.parse(Buffer.from(Buffer.from(bytes).toString(), "base64").toString("utf8"))
-  assert.deepEqual(
-    Object.keys(payload).sort(),
-    ["create_time", "md5", "name", "size", "sliceMd5"].sort(),
-  )
+  // 字段清单须与 CasFileEntry 一致：除基础 5 项外，还包含分片与网盘标识
+  // （slice_md5s / slice_size 供大文件秒传，cloud 区分网盘类型，空值表示 189）
+  assert.deepEqual(Object.keys(payload).sort(), [
+    "cloud",
+    "create_time",
+    "md5",
+    "name",
+    "size",
+    "sliceMd5",
+    "slice_md5s",
+    "slice_size",
+  ])
+  // 基础字段的值必须正确
+  assert.equal(payload.name, "hello.txt")
+  assert.equal(payload.md5, "5d41402abc4b2a76b9719d911017c592")
   const parsed = await parseSeed(bytes, "cas")
   assert.equal(parsed.cas?.name, "hello.txt")
   assert.equal(parsed.cas?.md5, "5d41402abc4b2a76b9719d911017c592")
