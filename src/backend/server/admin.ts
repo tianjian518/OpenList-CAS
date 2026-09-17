@@ -3459,12 +3459,35 @@ const driverConfigs: Record<string, any> = {
       { name: "encodePath", type: "bool", default: "true", required: false },
       { name: "withoutUrl", type: "bool", default: "false", required: false },
       { name: "withSign", type: "bool", default: "false", required: false },
+      // 对齐 Go Addition 的 SaveStrm* 字段。CF 版无本地磁盘，这两个开关
+      // 仅用于保持配置结构一致（便于导入 Go 侧导出的配置），不落盘。
       {
-        name: "casProxy",
+        name: "SaveStrmToLocal",
         type: "bool",
         default: "false",
         required: false,
-        help: "让 .strm 内的链接走本站代理。开启后可修正 139 CAS 直链带的 attachment 头（播放器会误判为下载）并把 HEAD 降级为 GET。代价是播放流量经本站中转。",
+        help: "保存 strm 到本地（CF 版无本地磁盘，仅占位）",
+      },
+      {
+        name: "SaveStrmLocalPath",
+        type: "text",
+        default: "",
+        required: false,
+        help: "strm 本地保存路径",
+      },
+      {
+        name: "SaveLocalMode",
+        type: "select",
+        default: "insert",
+        options: "insert,update,sync",
+        required: false,
+      },
+      {
+        name: "Version",
+        type: "text",
+        default: "",
+        required: false,
+        help: "配置版本；不为 5 时初始化会自动补齐默认扩展名与 /d 前缀（对齐 Go）",
       },
     ],
     config: {

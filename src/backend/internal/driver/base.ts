@@ -20,6 +20,23 @@ export interface FileItem {
    * 驱动若填了本字段，raw 路由会优先用它；否则退化为请求路径。
    */
   path?: string
+  /**
+   * `.cas` 占位文件的**预览名**（原始视频名，如 `第10集.mkv`）。
+   *
+   * 对齐 Go `server/handles/fsread.go:resolveCASPreviewTypeName` +
+   * `driver.CASPreviewNamer`：139 驱动通过 `CASPreviewName(ctx, obj)`
+   * 读出 `.cas` 内容里记录的真实文件名，FsGet 用它（而非 `.cas` 文件名）
+   * 计算响应的 `type` 字段：
+   *
+   *   typeName = resolveCASPreviewTypeName(ctx, storage, obj)   // → "第10集.mkv"
+   *   ...
+   *   Type: utils.GetFileType(typeName),                        // → VIDEO(2)
+   *
+   * 即：`/api/fs/get` 对 `.cas` 返回的 `name` 仍是 `第10集.mkv.cas`、
+   * `size` 仍是 540（占位大小），但 `type` 必须是真实视频的类型，
+   * 否则前端/播放器不认为它是可播放的视频。
+   */
+  cas_preview_name?: string
   /** Whole-file hash (e.g. md5) used for rapid upload */
   hash?: string
   /**
@@ -34,112 +51,112 @@ export interface FileItem {
   }
 }
 
+/**
+ * 计算 OpenList 前端使用的文件类型常量。
+ *
+ * **严格对齐 Go `pkg/utils/file.go` 的 `GetFileType`**：
+ *
+ *   func GetFileType(filename string) int {
+ *     ext := strings.ToLower(Ext(filename))
+ *     if SliceContains(conf.SlicesMap[conf.AudioTypes], ext) { return conf.AUDIO }
+ *     if SliceContains(conf.SlicesMap[conf.VideoTypes], ext) { return conf.VIDEO }
+ *     if SliceContains(conf.SlicesMap[conf.ImageTypes], ext) { return conf.IMAGE }
+ *     if SliceContains(conf.SlicesMap[conf.TextTypes], ext)  { return conf.TEXT }
+ *     return conf.UNKNOWN
+ *   }
+ *
+ * 顺序很关键（**AUDIO → VIDEO → IMAGE → TEXT**），且四个列表取自
+ * Go `internal/bootstrap/data/setting.go` 的默认值：
+ *
+ *   audio_types: mp3,flac,ogg,m4a,wav,opus,wma
+ *   video_types: mp4,mkv,avi,mov,rmvb,webm,flv,m3u8
+ *   image_types: jpg,tiff,jpeg,png,gif,bmp,svg,ico,swf,webp,avif
+ *   text_types : txt,htm,html,xml,java,properties,sql,js,md,json,conf,ini,
+ *                vue,php,py,bat,gitignore,yml,go,sh,c,cpp,h,hpp,tsx,vtt,
+ *                srt,ass,rs,lrc,**strm**
+ *
+ * ⚠️ 这里此前用的是自造的大杂烩列表，与 Go 有实质差异：
+ *   - 缺少 `strm` → `.strm` 得到 UNKNOWN(0) 而非 TEXT(4)；
+ *   - 多出 `ts`/`m2ts`/`wmv`/`3gp`/`asf` 等未在 Go 列表中的扩展名。
+ * 前端与播放器依赖 `type` 判定「是否可预览 / 用哪种预览器」，
+ * 不一致会直接导致播放行为不同（网易爆米花即依赖此字段）。
+ *
+ * 常量值（Go `internal/conf/const.go`）：
+ *   UNKNOWN=0, FOLDER=1, VIDEO=2, AUDIO=3, TEXT=4, IMAGE=5
+ */
 export function calcFileType(name: string, isDir: boolean): number {
   if (isDir) return 1 // FOLDER
   const ext = (name.split(".").pop() || "").toLowerCase()
-  const videoExts = [
-    "mp4",
-    "mkv",
-    "avi",
-    "mov",
-    "flv",
-    "wmv",
-    "ts",
-    "m2ts",
-    "m4v",
-    "rmvb",
-    "webm",
-    "3gp",
-    "asf",
-    "vob",
-    "ogv",
-    "rm",
-    "f4v",
-  ]
-  if (videoExts.includes(ext)) return 2 // VIDEO
+  // 与 Go 一致：无扩展名（split 后等于原名且不含点）视为 UNKNOWN
+  if (!name.includes(".")) return 0 // UNKNOWN
 
-  const audioExts = [
-    "mp3",
-    "flac",
-    "aac",
-    "wav",
-    "ogg",
-    "m4a",
-    "opus",
-    "wma",
-    "ape",
-    "alac",
-    "aiff",
-    "mid",
-    "midi",
-  ]
-  if (audioExts.includes(ext)) return 3 // AUDIO
+  // ── AUDIO (3) ── 注意 Go 先判音频
+  if (
+    ["mp3", "flac", "ogg", "m4a", "wav", "opus", "wma"].includes(ext)
+  )
+    return 3 // AUDIO
 
-  const textExts = [
-    "txt",
-    "md",
-    "markdown",
-    "json",
-    "js",
-    "ts",
-    "jsx",
-    "tsx",
-    "css",
-    "scss",
-    "html",
-    "htm",
-    "xml",
-    "yaml",
-    "yml",
-    "ini",
-    "conf",
-    "env",
-    "log",
-    "sql",
-    "py",
-    "java",
-    "c",
-    "cpp",
-    "h",
-    "hpp",
-    "go",
-    "rs",
-    "sh",
-    "bat",
-    "cmd",
-    "ps1",
-    "php",
-    "rb",
-    "swift",
-    "kt",
-    "cs",
-    "vue",
-    "svelte",
-    "json5",
-    "toml",
-  ]
-  if (textExts.includes(ext)) return 4 // TEXT
+  // ── VIDEO (2) ──
+  if (
+    ["mp4", "mkv", "avi", "mov", "rmvb", "webm", "flv", "m3u8"].includes(ext)
+  )
+    return 2 // VIDEO
 
-  const imageExts = [
-    "jpg",
-    "jpeg",
-    "png",
-    "gif",
-    "bmp",
-    "webp",
-    "svg",
-    "ico",
-    "tiff",
-    "tif",
-    "heic",
-    "heif",
-    "avif",
-    "vvc",
-    "avc",
-    "psd",
-    "ai",
-  ]
-  if (imageExts.includes(ext)) return 5 // IMAGE
+  // ── IMAGE (5) ──
+  if (
+    [
+      "jpg",
+      "tiff",
+      "jpeg",
+      "png",
+      "gif",
+      "bmp",
+      "svg",
+      "ico",
+      "swf",
+      "webp",
+      "avif",
+    ].includes(ext)
+  )
+    return 5 // IMAGE
+
+  // ── TEXT (4) ──
+  if (
+    [
+      "txt",
+      "htm",
+      "html",
+      "xml",
+      "java",
+      "properties",
+      "sql",
+      "js",
+      "md",
+      "json",
+      "conf",
+      "ini",
+      "vue",
+      "php",
+      "py",
+      "bat",
+      "gitignore",
+      "yml",
+      "go",
+      "sh",
+      "c",
+      "cpp",
+      "h",
+      "hpp",
+      "tsx",
+      "vtt",
+      "srt",
+      "ass",
+      "rs",
+      "lrc",
+      "strm",
+    ].includes(ext)
+  )
+    return 4 // TEXT
 
   return 0 // UNKNOWN
 }

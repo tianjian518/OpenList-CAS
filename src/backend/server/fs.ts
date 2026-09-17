@@ -25,6 +25,7 @@ import {
   canWrite as canWriteMeta,
 } from "../pkg/meta"
 import type { Meta } from "../pkg/meta"
+import { calcFileType } from "../internal/driver/base"
 import {
   getSignPolicy,
   signDownloadPath,
@@ -603,8 +604,9 @@ fsRouter.post("/get", async (c) => {
         modified: item.modified,
         sign,
         thumb: (item as any).thumb || "",
-        type: item.type ?? 0,
-        raw_url: rawUrl,
+        type: resolveFsGetType(item, provider),
+        raw_url: withRawUrlSign(rawUrl, sign),
+        raw_url_error: (item as any).raw_url_error || undefined,
         readme: getReadme(meta, reqPath),
         header: getHeader(meta, reqPath),
         provider,
@@ -617,6 +619,74 @@ fsRouter.post("/get", async (c) => {
     return c.json({ code: 500, message: safeErrorMessage(err), data: null })
   }
 })
+
+/**
+ * 给本地 `/p`（或 `/api/p`）形式的 `raw_url` 补上 `?sign=`，
+ * **对齐 Go `server/handles/fsread.go` FsGet 的行为**：
+ *
+ *   rawURL = fmt.Sprintf("%s/p%s%s", common.GetApiUrl(c),
+ *            utils.EncodePath(reqPath, true), query)   // query = "?sign=" + sign.Sign(reqPath)
+ *
+ * 为什么必须带上签名：`/p`、`/d` 端点没有 Auth 中间件（要能被 `<video src>`
+ * 等裸客户端消费），访问控制完全由签名决定。若不签名，客户端拿到
+ * `raw_url` 后直接请求会得到 401 —— 播放器表现为「无法播放」。
+ *
+ * 外部绝对地址（139 `.cas` 秒传还原后的 CDN 直链）不改动。
+ */
+function withRawUrlSign(rawUrl: string, sign: string): string {
+  if (!rawUrl || !sign) return rawUrl
+  if (/^https?:\/\//i.test(rawUrl)) return rawUrl
+  if (/[?&]sign=/.test(rawUrl)) return rawUrl
+  return `${rawUrl}${rawUrl.includes("?") ? "&" : "?"}sign=${encodeURIComponent(sign)}`
+}
+
+/**
+ * 计算 `/api/fs/get` 响应的 `type` 字段，**严格对齐 Go `server/handles/fsread.go` FsGet**：
+ *
+ *   typeName := obj.GetName()
+ *   if err == nil {
+ *     typeName = resolveCASPreviewTypeName(ctx, storage, obj)
+ *   }
+ *   ...
+ *   Type: utils.GetFileType(typeName),
+ *
+ * 其中 `resolveCASPreviewTypeName`：
+ *
+ *   namer, ok := storage.(driver.CASPreviewNamer)
+ *   if !ok || obj.IsDir() { return obj.GetName() }      // ← 目录/非 139 驱动原样返回
+ *   name, err := namer.CASPreviewName(ctx, obj)          // ← 139：.cas → 真实视频名
+ *   if err != nil || name == "" { return obj.GetName() }
+ *   return name
+ *
+ * ⚠️ 两个容易踩的坑，都与 139cas 的**实测行为**一致：
+ *
+ *   1. **目录的 type 是 0**。Go 用的是 `GetFileType(name)` 而不是 `GetObjType(name, isDir)`，
+ *      所以目录名（如 `万人之上 (2026)`）算出来的扩展名 `(2026)` 不在任何列表里
+ *      → `UNKNOWN(0)`。列表接口的目录才是 `FOLDER(1)`，详情接口是 0。
+ *   2. **只有 139 这类实现了 `CASPreviewNamer` 的存储才会展开 `.cas`**。
+ *      strm 存储没有实现该接口，所以 `/strm/xxx.mkv.cas` 的 `type` 是
+ *      `GetFileType("第10集.mkv.cas")` → 扩展名 `cas` 不在列表里 → 0。
+ *      而 `/移动/xxx.mkv.cas`（139 存储）会展开成 `第10集.mkv` → VIDEO(2)。
+ */
+function resolveFsGetType(item: any, provider: string): number {
+  const isDir = !!item?.is_dir
+  const name = String(item?.name || "")
+  // 目录：直接 GetFileType(目录名)
+  if (isDir) return calcFileType(name, false)
+
+  // 非目录：仅 139 系驱动会返回 cas_preview_name（对齐 CASPreviewNamer）
+  const providerNorm = String(provider || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+  const is139 =
+    providerNorm === "139" ||
+    providerNorm === "yun139" ||
+    providerNorm === "139yun"
+  const typeName = is139 && item?.cas_preview_name
+    ? String(item.cas_preview_name)
+    : name
+  return calcFileType(typeName, false)
+}
 
 function validateFileName(name: any): string {
   if (typeof name !== "string" || !name.trim()) {

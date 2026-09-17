@@ -309,39 +309,54 @@ rawRouter.get("/*", async (c) => {
               ["video", "audio"].includes(
                 (c.req.header("Sec-Fetch-Dest") || "").toLowerCase(),
               )
-            if (
-              is139 &&
-              playerLike &&
-              typeof (driver as any).link === "function" &&
-              /\.cas$/i.test(reqPath)
-            ) {
-              try {
-                const casLink = await (driver as any).link(
-                  reqPath,
-                  resolved.physical,
-                )
-                const casUrl = casLink?.url || ""
-                if (casUrl && casUrl !== fileItem?.raw_url) {
-                  console.log(
-                    `[rawRouter] CAS 302 for '${reqPath}' (${normDriver})`,
+            if (is139 && playerLike && /\.cas$/i.test(reqPath)) {
+              // 优先复用 `driver.get()` 已经还原好的直链。
+              //
+              // 139 驱动的 `get()` 内部就会对 `.cas` 调用 resolveCasPlayLink
+              // 做秒传还原，并把真实文件直链放进 `raw_url`。若这里再调一次
+              // `driver.link()`，等于**同一请求内做两遍秒传恢复** —— 第二遍
+              // 会因为临时文件已存在 / 子请求超限而失败，被 catch 吞掉后
+              // 回退成「代理那个 540 字节的占位文件」，播放器拿到垃圾数据。
+              //
+              // `.cas` 底层直链的特征：指向移动云 CDN（含 eos / mcloud 域名），
+              // 而不是本站的 `/api/p/...` 代理地址。以 540 字节占位文件大小为
+              // 辅证，避免把「还原失败后的占位直链」误判为已还原。
+              const raw = String(fileItem?.raw_url || "")
+              const restored =
+                !!raw &&
+                !raw.startsWith("/api/p/") &&
+                !raw.startsWith("/p/") &&
+                !raw.startsWith("/api/d/") &&
+                !raw.startsWith("/d/")
+              let casUrl = restored ? raw : ""
+              if (!casUrl && typeof (driver as any).link === "function") {
+                try {
+                  const casLink = await (driver as any).link(
+                    reqPath,
+                    resolved.physical,
                   )
-                  // 对齐 Go：Gin 的 `c.Redirect(302, url)` 会自动补上
-                  // `Content-Type: text/html; charset=utf-8`，此处显式补齐，
-                  // 保证与 139cas 的响应头逐项一致。
-                  c.header("Content-Type", "text/html; charset=utf-8")
-                  c.header(
-                    "Cache-Control",
-                    "max-age=0, no-cache, no-store, must-revalidate",
+                  casUrl = casLink?.url || ""
+                } catch (casErr: any) {
+                  console.warn(
+                    `[rawRouter] CAS link failed for '${reqPath}':`,
+                    casErr?.message,
                   )
-                  c.header("Referrer-Policy", "no-referrer")
-                  return c.body(null, 302, { Location: casUrl })
                 }
-              } catch (casErr: any) {
-                console.warn(
-                  `[rawRouter] CAS link failed for '${reqPath}':`,
-                  casErr?.message,
+              }
+              if (casUrl && !casUrl.startsWith("/")) {
+                console.log(
+                  `[rawRouter] CAS 302 for '${reqPath}' (${normDriver}, reused=${restored})`,
                 )
-                // 失败则退回代理链路，保证不劣化（至少还能播）
+                // 对齐 Go：Gin 的 `c.Redirect(302, url)` 会自动补上
+                // `Content-Type: text/html; charset=utf-8`，此处显式补齐，
+                // 保证与 139cas 的响应头逐项一致。
+                c.header("Content-Type", "text/html; charset=utf-8")
+                c.header(
+                  "Cache-Control",
+                  "max-age=0, no-cache, no-store, must-revalidate",
+                )
+                c.header("Referrer-Policy", "no-referrer")
+                return c.body(null, 302, { Location: casUrl })
               }
             }
           }

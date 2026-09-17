@@ -85,6 +85,7 @@ import { CFImgBedDriver } from "../../drivers/cloudflare_imgbed/driver"
 import { GuangYaPanDriver } from "../../drivers/guangyapan/driver"
 import { AutoIndexDriver } from "../../drivers/autoindex/driver"
 import { ProtonDriveDriver } from "../../drivers/proton_drive/driver"
+import { goEncodePath } from "../../pkg/urlpath"
 
 // LocalDriver is not available in Cloudflare Workers (no fs module).
 // When running in Node.js container mode, import dynamically on first use.
@@ -1642,8 +1643,35 @@ export async function getItem(
   return {
     item,
     provider: driverName,
-    rawUrl: `/api/p${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
+    rawUrl: buildRawUrl(virtualPath, item),
   }
+}
+
+/**
+ * 计算 `/api/fs/get` 返回的 `raw_url`，**对齐 Go `server/handles/fsread.go` 的 FsGet**。
+ *
+ * Go 的三条分支（storage.MustProxy() 为真时第 1 条恒成立）：
+ *   1. `rawURL = GenerateDownProxyURL(...)`，为空则
+ *      `fmt.Sprintf("%s/p%s%s", GetApiUrl(c), utils.EncodePath(reqPath, true), query)`
+ *      —— **绝对地址 + URL 编码 + 可选 `?sign=`**；
+ *   2. `typeName != obj.GetName()` 时 `buildObjectAccessURL(...)`（同样走 `/p` 或 `/d`）；
+ *   3. 否则用 `model.GetUrl(obj)`（驱动给的 CDN 直链）或 `fs.Link(...)` 的结果。
+ *
+ * 对 139 的 `.cas` 这类文件，驱动 `get()` 内部已做秒传还原并把 CDN 直链放进
+ * `raw_url`（对应上面的第 3 条），这里必须**透传**它，否则 `/api/p` 代理到
+ * 540 字节的占位文件，播放器拿到垃圾数据、表现为「无法播放」。
+ *
+ * 其余情况回退到 `/api/p{EncodePath(path)}` —— 注意必须做 URL 编码：
+ * 路径里含中文与空格（如 `万人之上 (2026)`）时，未编码的 URL 会被客户端
+ * 判定为非法（`InvalidURL: URL can't contain control characters`），
+ * 播放器直接放弃请求。
+ */
+function buildRawUrl(virtualPath: string, item: FileItem): string {
+  const raw = String(item?.raw_url || "")
+  // 驱动给出的绝对地址（CDN 直链）优先透传，对齐 Go 的 `model.GetUrl(obj)` 分支
+  if (/^https?:\/\//i.test(raw)) return raw
+  const signed = virtualPath.startsWith("/") ? virtualPath : "/" + virtualPath
+  return `/api/p${goEncodePath(signed)}`
 }
 
 export async function makeDirectory(
