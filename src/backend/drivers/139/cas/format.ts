@@ -30,6 +30,10 @@ export interface CasMeta {
   preId?: string
   /** SHA256（139 秒传的必需字段） */
   sha256?: string
+  /** 源文件所在目录 ID（部分工具会写入，用于定位来源） */
+  parentFileId?: string
+  /** CAS 生成时间（秒级字符串，来自载荷的 create_time） */
+  createTime?: string
 }
 
 /** CAS JSON 载荷（落盘格式） */
@@ -42,6 +46,7 @@ interface CasPayload {
   sha1?: string
   preID?: string
   sha256?: string
+  parentFileId?: string
   create_time?: string
 }
 
@@ -139,6 +144,8 @@ export function decodeCas(content: string | ArrayBuffer | Uint8Array): CasMeta {
     sha1: payload.sha1,
     preId: payload.preID,
     sha256: payload.sha256,
+    parentFileId: payload.parentFileId,
+    createTime: payload.create_time,
   }
 }
 

@@ -313,3 +313,56 @@ export function makeTempPrefix(): string {
   const stamp = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
   return `${CAS_TEMP_PREFIX}${stamp}_`
 }
+
+/**
+ * 清理临时目录中的**全部**遗留副本（不看年龄）。
+ *
+ * 与 `sweepTempFiles` 的区别：
+ *   - `sweepTempFiles` 只清"超过 N 分钟"的，用于播放前顺手清理，
+ *     避免误删正在被播放器读取的副本；
+ *   - 本函数用于**定时任务**场景：此时不会有任何副本正在使用
+ *     （播放请求是短暂的，且副本寿命以分钟计），可以放心全清。
+ *
+ * Serverless 环境没有常驻进程，`ctx.waitUntil` 又只有约 30 秒寿命，
+ * 因此"播放后延时删除"在 Workers 上不可靠 —— 定时触发才是唯一
+ * 能稳定兜底的清理时机。
+ *
+ * @param client 139 客户端
+ * @param rootId 根目录 ID（用于定位 TEMP 目录）
+ * @param maxCount 单次最多清理的文件数，防止一次请求超时/超限
+ * @returns 实际清理掉的文件数量
+ */
+export async function sweepTempFilesAll(
+  client: Yun139ApiClient,
+  rootId: string,
+  maxCount = 200,
+): Promise<number> {
+  let removed = 0
+  try {
+    // 注意：这里**必须**走 ensureTempDir 的"查找"分支而非缓存 ID，
+    // 否则定时任务里拿不到 tempDirId（没有请求上下文可复用）。
+    const tempDirId = await ensureTempDir(client, rootId)
+    const { files } = await client.listFiles(tempDirId)
+
+    let handled = 0
+    for (const f of files) {
+      if (handled >= maxCount) break
+
+      const name = f.contentName || ""
+      // ⚠️ 只清自己前缀的文件。
+      // TEMP 目录里理论上只有本驱动产生的副本，但为绝对安全，
+      // 这里严格匹配 `TEMP_139CAS_` 前缀：即使有人往 TEMP 放了
+      // 别的文件（或 NAS 版将来也用同名目录），也绝不会被误删。
+      if (!name.startsWith(CAS_TEMP_PREFIX)) continue
+
+      if (f.contentID) {
+        await safeDelete(client, f.contentID)
+        removed++
+        handled++
+      }
+    }
+  } catch {
+    // 定时清理失败不影响任何用户请求
+  }
+  return removed
+}

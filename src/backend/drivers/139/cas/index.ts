@@ -26,6 +26,7 @@ export {
   restoreFromCas,
   safeDelete,
   sweepTempFiles,
+  sweepTempFilesAll,
   type RapidResult,
 } from "./restore"
 

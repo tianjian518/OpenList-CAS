@@ -17,7 +17,7 @@ import {
   normalizeAllowlist,
   toCasName,
 } from "./format"
-import { buildPartInfos } from "./restore"
+import { buildPartInfos, sweepTempFilesAll } from "./restore"
 import { shouldHandleCas } from "./player"
 
 /* ------------------------- 文件名 ------------------------- */
@@ -209,4 +209,94 @@ test("buildPartInfos 分片数封顶 100", () => {
   // 100 片 × 10MB = 1000MB，超出的部分不再声明
   const parts = buildPartInfos(2000 * 1024 * 1024)
   assert.equal(parts.length, 100)
+})
+
+/* --------------------- 定时清扫（sweepTempFilesAll） --------------------- */
+
+/**
+ * 构造一个假的 139 client：
+ * - listFiles(root)      → 返回 TEMP 目录
+ * - listFiles(tempDirId) → 返回待清理文件
+ * - request(batchTrash)  → 记录被删除的 fileId
+ */
+function makeFakeClient(files: Array<{ contentID: string; contentName: string }>) {
+  const deleted: string[] = []
+  const client: any = {
+    async listFiles(id: string) {
+      if (id === "TEMP_ID") return { folders: [], files }
+      return { folders: [{ catalogName: "TEMP", catalogID: "TEMP_ID" }], files: [] }
+    },
+    async request(path: string, body: any) {
+      if (path === "/recyclebin/batchTrash") {
+        deleted.push(...body.fileIds)
+      }
+      return {}
+    },
+  }
+  return { client, deleted }
+}
+
+test("sweepTempFilesAll 清空全部带前缀的临时副本", async () => {
+  const { client, deleted } = makeFakeClient([
+    { contentID: "f1", contentName: "TEMP_139CAS_1700000000_abc_影片.mp4" },
+    { contentID: "f2", contentName: "TEMP_139CAS_1700000001_def_剧集.mkv" },
+    // 刚生成的副本也在清理范围内（定时任务场景不会误删正在播放的）
+    {
+      contentID: "f3",
+      contentName: `TEMP_139CAS_${Date.now()}_ghi_新片.mp4`,
+    },
+  ])
+
+  const removed = await sweepTempFilesAll(client, "/")
+  assert.equal(removed, 3)
+  assert.deepEqual(deleted.sort(), ["f1", "f2", "f3"])
+})
+
+test("sweepTempFilesAll 绝不触碰非本前缀的文件（保护 NAS 等共存数据）", async () => {
+  const { client, deleted } = makeFakeClient([
+    { contentID: "mine1", contentName: "TEMP_139CAS_1700000000_a_x.mp4" },
+    // NAS（Go 版）产生的文件：前缀不是 TEMP_139CAS_
+    { contentID: "nas1", contentName: "TEMP_1700000000_b_y.mp4" },
+    // 用户手动放进去的文件
+    { contentID: "user1", contentName: "我的备份.mp4" },
+    // 形似但前缀不完整，也必须放过
+    { contentID: "fake1", contentName: "TEMP_139CASX_1700_z.mp4" },
+  ])
+
+  const removed = await sweepTempFilesAll(client, "/")
+  assert.equal(removed, 1)
+  assert.deepEqual(deleted, ["mine1"])
+})
+
+test("sweepTempFilesAll 遵守 maxCount 上限，避免单次超时", async () => {
+  const files = Array.from({ length: 10 }, (_, i) => ({
+    contentID: `c${i}`,
+    contentName: `TEMP_139CAS_17000000${i}_x_f${i}.mp4`,
+  }))
+  const { client, deleted } = makeFakeClient(files)
+
+  const removed = await sweepTempFilesAll(client, "/", 3)
+  assert.equal(removed, 3)
+  assert.equal(deleted.length, 3)
+})
+
+test("sweepTempFilesAll 在接口异常时静默返回 0（不影响用户请求）", async () => {
+  const client: any = {
+    async listFiles() {
+      throw new Error("network down")
+    },
+  }
+  const removed = await sweepTempFilesAll(client, "/")
+  assert.equal(removed, 0)
+})
+
+test("sweepTempFilesAll 跳过没有 contentID 的条目", async () => {
+  const { client, deleted } = makeFakeClient([
+    { contentID: "", contentName: "TEMP_139CAS_1700000000_a_x.mp4" },
+    { contentID: "ok", contentName: "TEMP_139CAS_1700000000_b_y.mp4" },
+  ])
+
+  const removed = await sweepTempFilesAll(client, "/")
+  assert.equal(removed, 1)
+  assert.deepEqual(deleted, ["ok"])
 })
