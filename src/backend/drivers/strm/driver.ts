@@ -153,6 +153,49 @@ export class StrmDriver implements StorageDriver {
       .filter(Boolean)
     this.downloadSuffix = new Set(downloadTypes)
 
+    // ── 对齐 Go `if d.Version != 5 { ... }` 的迁移逻辑 ──────────────────
+    //
+    // Go 的这段是**向后兼容**：老配置（Version < 5）没有完整扩展名列表，
+    // 也不一定有 PathPrefix，于是 Init 时补齐默认值并把 Version 置 5。
+    //
+    //   types := strings.SplitSeq("mp4,mkv,...,alac", ",")
+    //   for ext := range types {
+    //     if _, ok := d.supportSuffix[ext]; !ok {
+    //       d.supportSuffix[ext] = struct{}{}
+    //       supportTypes = append(supportTypes, ext)
+    //     }
+    //   }
+    //   d.FilterFileTypes = strings.Join(supportTypes, ",")
+    //   ... 同理补 DownloadFileTypes ...
+    //   d.PathPrefix = "/d"
+    //   d.Version = 5
+    //
+    // 意义：用户从旧版升级、或分享配置给网友时，即使 paths/扩展名列表不全，
+    // 也能得到与新版一致的行为（否则 `.strm` 里会缺 `/d` 前缀而全部播不了）。
+    if (Number(this.addition.Version) !== 5) {
+      const DEFAULT_FILTER =
+        "mp4,mkv,flv,avi,wmv,ts,rmvb,webm,mp3,flac,aac,wav,ogg,m4a,wma,alac"
+      const DEFAULT_DOWNLOAD = "ass,srt,vtt,sub,strm"
+      for (const ext of DEFAULT_FILTER.split(",")) {
+        const e = ext.trim().toLowerCase()
+        if (e && !this.supportSuffix.has(e)) {
+          this.supportSuffix.add(e)
+          supportTypes.push(e)
+        }
+      }
+      for (const ext of DEFAULT_DOWNLOAD.split(",")) {
+        const e = ext.trim().toLowerCase()
+        if (e && !this.downloadSuffix.has(e)) {
+          this.downloadSuffix.add(e)
+          downloadTypes.push(e)
+        }
+      }
+      this.addition.filterFileTypes = supportTypes.join(",")
+      this.addition.downloadFileTypes = downloadTypes.join(",")
+      if (!this.addition.PathPrefix) this.addition.PathPrefix = "/d"
+      this.addition.Version = 5
+    }
+
     // 预解析底层 storage（动态 import 避免循环依赖）
     const { resolvePath } = await import("../../internal/model/db")
     const { getDriver } = await import("../../internal/op/storage")

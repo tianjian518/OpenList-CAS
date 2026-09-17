@@ -8,13 +8,17 @@ export interface StrmAddition {
   encodePath?: boolean
   withoutUrl?: boolean
   withSign?: boolean
-  /**
-   * 是否让 .strm 里的链接走 OpenList 自身代理（`?proxy=true`）。
-   *
-   * 开启原因：139 的 EOS 中转链带 `Content-Disposition: attachment` 且对
-   * HEAD 返回 403，播放器会判定为不可播放。代理层会改写为 inline 并把
-   * HEAD 降级为 GET。代价是流量经 Worker，按需开启。
-   */
-  casProxy?: boolean
   root_folder_path?: string
+  /**
+   * 配置版本号（对齐 Go `Addition.Version`）。
+   *
+   * Go 在 `Init` 里判断 `Version != 5` 时补齐默认扩展名列表并设
+   * `PathPrefix = "/d"`，然后写回 5 —— 这是给老配置/网友分享的配置做的
+   * 向后兼容。缺了它，旧配置生成的 `.strm` 会丢掉 `/d` 前缀而无法播放。
+   */
+  Version?: number
+  /** 对齐 Go `SaveStrmToLocal` 等字段（当前 CF 版仅作占位，不落盘） */
+  SaveStrmToLocal?: boolean
+  SaveStrmLocalPath?: string
+  SaveLocalMode?: string
 }
