@@ -12,6 +12,17 @@ import { StrmAddition } from "./types"
 
 interface RemoteTarget {
   driver: StorageDriver
+  /** 该映射对应的存储对象（用于判断解析结果是否落在同一存储上） */
+  storage: any
+  /** 配置里的原始虚拟路径（Go 侧传给 fs.List 的 dst），如 `/移动/移动CAS/移动影视CAS` */
+  virtualPath: string
+  /**
+   * 该映射在【挂载点内部的相对路径】，如 `/移动CAS/移动影视CAS`。
+   *
+   * 由 init 阶段一次性算出：`resolvePath(virtualPath).physical`。
+   * 之所以要单独存，是因为底层驱动的 `list/get` 接收的是「存储内相对路径」，
+   * 而 `paths` 配置给的是「完整虚拟路径」。
+   */
   physical: string
 }
 
@@ -132,6 +143,8 @@ export class StrmDriver implements StorageDriver {
             )
             this.remotes.set(dst, {
               driver,
+              storage: resolved.storage,
+              virtualPath: dst,
               physical: resolved.physical || "/",
             })
           }
@@ -282,9 +295,30 @@ export class StrmDriver implements StorageDriver {
     return s.endsWith(suffix) ? s.slice(0, s.length - suffix.length) : s
   }
 
+  /**
+   * 列出远端目录内容。
+   *
+   * **与 Go `(d *Strm) list` 严格对齐：**
+   *
+   *   func (d *Strm) list(ctx context.Context, dst, sub string, args *fs.ListArgs) ([]model.Obj, error) {
+   *     reqPath := stdpath.Join(dst, sub)     // ← dst 是【配置里的原始虚拟路径】
+   *     objs, err := fs.List(ctx, reqPath, args)
+   *     ...
+   *   }
+   *
+   * 关键：Go 把 `dst`（如 `/移动/移动CAS/移动影视CAS`，**带挂载点**）与 `sub`
+   * 拼成**完整虚拟路径**后交给 `fs.List`，由 fs 层自己去解析挂载点。
+   *
+   * 此前 CF 版错误地使用 `resolvePath(dst).physical`（**已剥离挂载点**的相对
+   * 路径，如 `/移动CAS/移动影视CAS`）来拼接，一旦用户修改 `paths` 导致挂载点
+   * 层级变化，拼出来的路径就会落到错误的存储位置 —— 表现为「改配置就崩」。
+   * 这里改为与 Go 一致：拼完整虚拟路径，交给 op 层解析。
+   */
   private async listRemote(dst: string, sub: string): Promise<FileItem[]> {
     const remote = this.remotes.get(dst)
     if (!remote) return []
+    // `physical` 是该映射在存储内部的相对路径（init 阶段算好），
+    // `sub` 是挂载点之后的子路径，两者拼接即底层驱动认识的路径。
     const remotePath = joinPath(remote.physical, sub)
     try {
       return await remote.driver.list("", remotePath)
@@ -391,6 +425,7 @@ export class StrmDriver implements StorageDriver {
     for (const dst of dsts) {
       const remote = this.remotes.get(dst)
       if (!remote) continue
+      // 对齐 Go：`fs.Get(ctx, stdpath.Join(dst, sub))`
       const remotePath = joinPath(remote.physical, sub)
       try {
         const item = await remote.driver.get("", remotePath)
