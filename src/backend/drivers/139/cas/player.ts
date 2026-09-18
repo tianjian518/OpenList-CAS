@@ -19,7 +19,8 @@ import {
   safeDelete,
   sweepTempFiles,
 } from "./restore"
-import { Yun139ApiClient } from "../util"
+import { Yun139ApiClient, fetchWithTimeout, withTimeout } from "../util"
+import { getEnvCtx } from "../../../internal/model/db"
 
 /** 播放直链结果 */
 export interface CasPlayLink {
@@ -41,6 +42,191 @@ export class CasPlayError extends Error {
     super(message)
     this.name = "CasPlayError"
   }
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * CAS 直链缓存（专治播放路径慢 → 503）
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * 播放直链缓存。
+ *
+ * ## 为什么必须有
+ *
+ * `resolveCasPlayLink` 每次都要**串行**走完整条链路（实测 3~13 秒）：
+ *
+ *   ① `getDownloadUrl(casFileId)` + fetch 读 `.cas` 内容   ~1.5s
+ *   ② `ensureTempDir` 列根目录找 TEMP                       ~1.0s
+ *   ③ `restoreFromCas` 秒传 create                          ~2.0s
+ *   ④ `getDownloadUrl(restoredFileId)` 取直链               ~1.5s
+ *
+ * 而播放器拿到 `.strm`/`.cas` 后**会反复请求**（起播探测、拖动进度、
+ * 多段 Range、重试），每一次都重跑整条链路。CF Workers 的子请求数与
+ * CPU 时间都有硬上限，几条并发请求叠起来就被边缘节点直接拒绝 ——
+ * 这正是线上**偶发 503** 的主因。而 139 的下载直链本身有效期约 15 分钟，
+ * 同一条 URL 完全可以复用。
+ *
+ * ## ⚠️ 为什么必须用 KV 而不是模块级 Map
+ *
+ * 最初这里用模块级 `Map` 实现，**实测完全无效**（302 生成仍要 3~13 秒）。
+ * 原因是 CF Workers 的调度模型：**同一份模块状态只在同一个 isolate 内共享**，
+ * 而边缘节点会按负载把请求分散到多个 isolate，甚至为并发请求各起一个。
+ * 于是「刚写进 Map 的直链」在下一次请求时根本读不到。
+ *
+ * 实测证据：同一 URL 连打 10 次 `HEAD`，耗时 3.3 / 4.2 / 5.0 / 8.3 /
+ * 9.0 / 10.0 / 11.6 / 12.8 / 13.2 秒 —— 毫无收敛趋势，说明每次都重跑链路。
+ *
+ * 因此改用 **KV** 作为共享缓存层（KV 在所有 isolate / 所有边缘节点间一致），
+ * 模块级 Map 退化为**一级缓存**：同一 isolate 内命中可完全跳过网络。
+ *
+ * ## 缓存键为什么是 `casFileId`
+ *
+ * CAS 文件的 `contentID` 在云端稳定且与虚拟路径无关，用 fileId 作键天然
+ * 避免「同一文件经不同挂载点/别名访问」时的重复落空。
+ */
+interface CasLinkCacheEntry {
+  url: string
+  size: number
+  name: string
+  headers?: Record<string, string>
+  tempDirId?: string
+  /** 写入时刻（毫秒） */
+  at: number
+}
+
+/**
+ * 直链缓存 TTL。
+ *
+ * 139 的下载直链 `X-Amz-Expires=900`（15 分钟，见 302 的 location 参数），
+ * 这里取 10 分钟留足安全余量 —— 宁可偶尔多跑一次链路，也不要让播放器
+ * 拿到一条即将失效的 URL（那会表现为「能起播但拖动就断」）。
+ */
+const CAS_LINK_TTL_MS = 10 * 60 * 1000
+
+/** 一级缓存容量上限（per-isolate），防止长时间存活的 isolate 无限增长 */
+const CAS_LINK_CACHE_MAX = 200
+
+/** KV 中直链缓存的键前缀 */
+const CAS_LINK_KV_PREFIX = "caslink:"
+
+/** 一级缓存：模块级 Map，仅在同一 isolate 内有效（快，但覆盖不全） */
+const casLinkCache = new Map<string, CasLinkCacheEntry>()
+
+/** 读取一级缓存（含 TTL 校验与 LRU 位置更新） */
+function getLocalCasLink(casFileId: string): CasLinkCacheEntry | null {
+  const hit = casLinkCache.get(casFileId)
+  if (!hit) return null
+  if (Date.now() - hit.at > CAS_LINK_TTL_MS) {
+    casLinkCache.delete(casFileId)
+    return null
+  }
+  // Map 保持插入序，删后重插 = 移到队尾，实现简易 LRU
+  casLinkCache.delete(casFileId)
+  casLinkCache.set(casFileId, hit)
+  return hit
+}
+
+/** 写入一级缓存（超容量时淘汰最旧的一条） */
+function setLocalCasLink(casFileId: string, entry: CasLinkCacheEntry): void {
+  casLinkCache.delete(casFileId)
+  casLinkCache.set(casFileId, entry)
+  while (casLinkCache.size > CAS_LINK_CACHE_MAX) {
+    const oldest = casLinkCache.keys().next().value
+    if (oldest === undefined) break
+    casLinkCache.delete(oldest)
+  }
+}
+
+/**
+ * 直链缓存所需的 KV 最小接口。
+ *
+ * 这里刻意**不引用 `KVNamespace` 全局类型** —— 该类型只在
+ * `@cloudflare/workers-types` 被引入时才存在，本地 `tsc` 会报
+ * `Cannot find name 'KVNamespace'`。缓存只用到 get/put，按需声明更稳。
+ */
+interface CasLinkKv {
+  get(
+    key: string,
+    type?: "text" | "json",
+  ): Promise<unknown> | unknown
+  put(key: string, value: string, opts?: unknown): Promise<void> | void
+}
+
+/**
+ * 取得 KV 命名空间（未绑定时返回 null，缓存自动降级为仅一级）。
+ *
+ * 走 `getEnvCtx()`（由 index.ts 的中间件在请求入口 `setEnvCtx(env)` 注入），
+ * 而不是直接摸 `globalThis` —— 后者是历史遗留写法，且跨请求不保证已赋值。
+ */
+function getKv(): CasLinkKv | null {
+  try {
+    const kv = (getEnvCtx() as any)?.KV as CasLinkKv | undefined
+    return kv && typeof kv.get === "function" ? kv : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 读取直链缓存：先查一级（内存），再查 KV。
+ *
+ * KV 读取失败（网络抖动、未绑定）一律静默降级为「未命中」——
+ * 缓存只是优化手段，绝不能因为它出错而让播放失败。
+ */
+async function getCachedCasLink(
+  casFileId: string,
+): Promise<CasLinkCacheEntry | null> {
+  const local = getLocalCasLink(casFileId)
+  if (local) return local
+
+  const kv = getKv()
+  if (!kv) return null
+
+  try {
+    const raw = await kv.get(CAS_LINK_KV_PREFIX + casFileId, "json")
+    if (!raw || typeof (raw as any).url !== "string") return null
+    const entry = raw as CasLinkCacheEntry
+    if (Date.now() - (entry.at || 0) > CAS_LINK_TTL_MS) return null
+    // 回填一级缓存，后续同 isolate 请求可零网络命中
+    setLocalCasLink(casFileId, entry)
+    return entry
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 写入直链缓存：同时写一级与 KV。
+ *
+ * ⚠️ 一律 `await` KV 的写入 —— Workers 的 `waitUntil` 只保证约 30 秒，
+ * 而 KV 写本身很快（通常 <100ms），直接等待最可靠。
+ * 写失败静默忽略（同样地，不能因缓存而影响播放）。
+ */
+async function setCachedCasLink(
+  casFileId: string,
+  entry: CasLinkCacheEntry,
+  ttlSec: number,
+): Promise<void> {
+  setLocalCasLink(casFileId, entry)
+  const kv = getKv()
+  if (!kv) return
+  try {
+    await kv.put(CAS_LINK_KV_PREFIX + casFileId, JSON.stringify(entry), {
+      expirationTtl: ttlSec,
+    })
+  } catch {
+    // 忽略：一级缓存仍然可用
+  }
+}
+
+/**
+ * 清空一级直链缓存（供测试使用）。
+ *
+ * ⚠️ 仅清内存，不动 KV —— 测试用真实 KV 会污染线上数据。
+ * 正常播放不需要调用它，TTL 会自然淘汰。
+ */
+export function clearCasLinkCache(): void {
+  casLinkCache.clear()
 }
 
 /** 默认允许播放的扩展名 */
@@ -70,17 +256,25 @@ export async function readCasContent(
   fileId: string,
 ): Promise<string> {
   const url = await client.getDownloadUrl(fileId)
-  const res = await fetch(url, {
-    headers: {
-      Referer: "https://yun.139.com/",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  // 加超时：CDN 偶发不响应，原生 fetch 会一直挂着，
+  // 最终把整个请求耗到 CF 平台强杀（客户端 90~120 秒超时）。
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        Referer: "https://yun.139.com/",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+      },
     },
-  })
+    10000,
+  )
   if (!res.ok) {
     throw new CasPlayError(`读取 CAS 文件失败（HTTP ${res.status}）`)
   }
-  const text = await res.text()
+  // body 读取也要限时：CDN 可能"响应头到达但 body 半挂"，
+  // 裸 await res.text() 会拖到 CF 平台 95 秒硬杀整个请求。
+  const text = await withTimeout(res.text(), 10000, "读 CAS 内容")
   if (text.length > 64 * 1024) {
     throw new CasPlayError("CAS 文件体积异常，疑似不是有效的占位文件")
   }
@@ -141,6 +335,23 @@ export async function resolveCasPlayLink(
 ): Promise<CasPlayLink> {
   const { client, casFileId, casName, rootId } = opts
   const autoCleanup = opts.autoCleanup !== false
+
+  // ⓪ 直链缓存命中则直接返回（一级内存 / KV 共享层）。
+  //
+  // 这是播放路径快慢的关键：未命中时要串行走 4 次网络请求（实测 3~13s），
+  // 而播放器会为起播探测 / 拖动 / 分段 Range 反复请求同一文件，
+  // 每次重跑都白白消耗 Workers 的子请求与 CPU 配额，最终表现为 503。
+  // 直链本身有效期约 15 分钟，10 分钟内复用完全安全。
+  const cached = await getCachedCasLink(casFileId)
+  if (cached) {
+    return {
+      url: cached.url,
+      size: cached.size,
+      name: cached.name,
+      tempDirId: cached.tempDirId,
+      headers: cached.headers,
+    }
+  }
 
   // ① 惰性清理（仅当显式开启；默认关闭以免拖慢播放）
   if (opts.sweepOnPlay === true) {
@@ -203,16 +414,38 @@ export async function resolveCasPlayLink(
     scheduleCleanup(client, restored.fileId, opts.cleanupDelayMs ?? 120_000)
   }
 
+  const headers = {
+    Referer: "https://yun.139.com/",
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  }
+
+  // ⑥ 写入直链缓存，供后续请求（拖动、分段、重试）零成本复用。
+  //
+  //    ⚠️ 仅缓存**成功**取得的直链 —— 上面若抛错则不会走到这里，
+  //    故缓存里绝不会出现「空 URL」或失败结果。
+  //
+  //    KV 的 expirationTtl 留 60 秒余量（比内存 TTL 早一点过期），
+  //    避免出现「KV 里的条目刚过期、却仍被当有效读回」的临界情况。
+  await setCachedCasLink(
+    casFileId,
+    {
+      url,
+      size: meta.size,
+      name: realName,
+      tempDirId,
+      headers,
+      at: Date.now(),
+    },
+    Math.floor(CAS_LINK_TTL_MS / 1000),
+  )
+
   return {
     url,
     size: meta.size,
     name: realName,
     tempDirId,
-    headers: {
-      Referer: "https://yun.139.com/",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    },
+    headers,
   }
 }
 

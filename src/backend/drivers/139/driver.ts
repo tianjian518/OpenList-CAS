@@ -167,7 +167,33 @@ export class Yun139Driver implements StorageDriver {
       // 索引没有才真正发请求
       const disk = await this.client.listFiles(currentCatalogId)
       const foundFolder = disk.folders.find((f) => f.catalogName === part)
-      if (!foundFolder) break
+
+      /**
+       * ⚠️ 这里**必须抛错**，绝不能 `break`。
+       *
+       * 曾经写的是 `if (!foundFolder) break`，然后返回上一层的
+       * `currentCatalogId` —— 后果极其隐蔽且严重：
+       *
+       *   请求 `/移动/移动CAS/cas600t/动漫/B/x.cas`，若索引里
+       *   `/移动/移动CAS` 缺失，解析到 `/移动` 就 break，把 **`/移动`
+       *   的 catalogID 当作最终结果返回**。上层拿到这个错误 ID 去
+       *   `listFiles`，自然找不到 `移动CAS`，于是报出畸形路径
+       *   `Item not found: /移动CAS/cas600t/...`（注意 `/移动` 被"吃掉"了），
+       *   让人误以为是路径拼接问题而查错方向。
+       *
+       *   更糟的是 `break` 返回的 ID 指向**上层的大目录**，`listFiles`
+       *   会把那一整层的内容全部拉回来（`/移动` 下有大量子目录），
+       *   在 Workers 上表现为请求挂死（客户端 120s 超时）或子请求超限（503）。
+       *
+       * 抛错能让失败**定位到具体是哪一层不存在**，同时避免用错误 ID
+       * 继续做昂贵且无意义的调用。
+       */
+      if (!foundFolder) {
+        throw new Error(
+          `目录不存在：${nextPath}（在「${currentPath}」下未找到子目录「${part}」，` +
+            `已解析层级 ${i + 1}/${parts.length}）`,
+        )
+      }
 
       currentCatalogId = foundFolder.catalogID
       currentPath = nextPath

@@ -268,6 +268,31 @@ export async function getKvBinding(envCtx?: any): Promise<{
   return { binding: null, platform: "Memory", mode: "none" }
 }
 
+/**
+ * KV 读取超时（毫秒）。
+ * CF KV 在边缘缓存未命中时要回源中心存储，个别大 key（如 139 索引 45KB）
+ * 冷读时可能长时间不返回。没有超时会拖死整个请求（实测 57% 请求卡死）。
+ * 阈值取 3 秒：正常读取 <100ms，超过 3 秒基本就是回源卡住了，
+ * 此时降级为「读不到」，让上层走缓存或重建，好过整个请求挂起。
+ */
+const KV_READ_TIMEOUT_MS = 3000
+
+async function withKvTimeout<T>(p: Promise<T>, key: string): Promise<T> {
+  let timer: any
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`KV read timeout after ${KV_READ_TIMEOUT_MS}ms: ${key}`))
+        }, KV_READ_TIMEOUT_MS)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function readFromKv(
   kvInfo: Awaited<ReturnType<typeof getKvBinding>>,
   key = "openlist_config",
@@ -286,26 +311,51 @@ async function readFromKv(
         return typeof text === "string" ? JSON.parse(text) : text
       }
     } else if (mode === "binding" || mode === "proxy") {
+      // 【超时兜底】CF KV 的 get() 在边缘缓存未命中时会同步回源到中心存储，
+      // 没有超时保护时会**无限挂起**，表现为请求卡死十几秒后被平台掐断。
+      // 实测线上某大 key（45KB 索引）冷读时 57% 的请求直接卡死。
+      // 这里给每次 KV 读取套上超时，宁可降级为「读不到」也不能拖死整个请求。
       let val: any = null
       try {
-        // Cloudflare KV 支持 (key, "text")，EdgeOne KV 支持 (key)
-        val = await binding.get(key, "text")
+        val = await withKvTimeout(
+          (async () => {
+            try {
+              // Cloudflare KV 支持 (key, "text")，EdgeOne KV 支持 (key)
+              return await binding.get(key, "text")
+            } catch {
+              return await binding.get(key)
+            }
+          })(),
+          key,
+        )
       } catch {
-        val = await binding.get(key)
+        val = null
       }
       if (val === undefined || val === null) {
-        val = await binding.get(key)
+        try {
+          val = await withKvTimeout(binding.get(key), key)
+        } catch {
+          val = null
+        }
       }
       if (val) {
-        return typeof val === "string" ? JSON.parse(val) : val
+        try {
+          return typeof val === "string" ? JSON.parse(val) : val
+        } catch (err) {
+          console.error("[KV/Blob Store] JSON 解析失败:", key, err)
+          return null
+        }
       }
     } else if (binding.type === "cf_rest") {
       const url = `https://api.cloudflare.com/client/v4/accounts/${binding.accountId}/storage/kv/namespaces/${binding.namespaceId}/values/${key}`
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${binding.token}` },
-      })
+      const res = await withKvTimeout(
+        fetch(url, {
+          headers: { Authorization: `Bearer ${binding.token}` },
+        }),
+        key,
+      )
       if (res.ok) {
-        const text = await res.text()
+        const text = await withKvTimeout(res.text(), key)
         return JSON.parse(text)
       }
     }

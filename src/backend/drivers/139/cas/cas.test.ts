@@ -18,7 +18,11 @@ import {
   toCasName,
 } from "./format"
 import { buildPartInfos, sweepTempFilesAll } from "./restore"
-import { shouldHandleCas } from "./player"
+import {
+  shouldHandleCas,
+  clearCasLinkCache,
+  resolveCasPlayLink,
+} from "./player"
 
 /* ------------------------- 文件名 ------------------------- */
 
@@ -312,4 +316,276 @@ test("sweepTempFilesAll 跳过没有 contentID 的条目", async () => {
   const removed = await sweepTempFilesAll(client, "/")
   assert.equal(removed, 1)
   assert.deepEqual(deleted, ["ok"])
+})
+
+/* -------------------- CAS 直链缓存（治播放慢 / 503） -------------------- */
+
+/** 构造一个可计数的假 139 客户端，用于观察缓存是否真的省掉了往返 */
+function makeCountableClient() {
+  const calls = { downloadUrl: 0, request: 0 }
+  // `.cas` 内容是 base64(JSON)，必须用 encodeCas 生成合法桩数据
+  const casContent = encodeCas({
+    name: "movie.mkv",
+    size: 1234,
+    sha256: "a".repeat(64),
+  } as any)
+  const client: any = {
+    async getDownloadUrl() {
+      calls.downloadUrl++
+      return "https://cdn.example.com/cas"
+    },
+    async listFiles() {
+      return { folders: [{ id: "temp-1", name: "TEMP" }], files: [] }
+    },
+    async request() {
+      calls.request++
+      return { data: { exist: true, rapidUpload: true, fileId: "real-1" } }
+    },
+  }
+  return { client, calls, casContent }
+}
+
+test("resolveCasPlayLink 二次调用命中缓存，不再发起任何网络往返", async () => {
+  // 线上 503 的核心成因：播放器会为起播/拖动/分段反复请求同一文件，
+  // 每次都要串行走 4 次网络请求（实测 3~13 秒），很快耗尽 Workers 的
+  // 子请求与 CPU 配额。直链有效期约 15 分钟，缓存后可零成本复用。
+  clearCasLinkCache()
+
+  const { client, calls, casContent } = makeCountableClient()
+  // 打桩 fetch（readCasContent 用它读 .cas 内容）
+  const realFetch = globalThis.fetch
+  let fetchCount = 0
+  globalThis.fetch = (async () => {
+    fetchCount++
+    return new Response(casContent, { status: 200 })
+  }) as any
+
+  try {
+    const opts = {
+      client,
+      rootId: "/",
+      casFileId: "cas-1",
+      casName: "movie.mkv.cas",
+      autoCleanup: false,
+    }
+    const first = await resolveCasPlayLink(opts as any)
+    const afterFirst = { ...calls, fetchCount }
+
+    const second = await resolveCasPlayLink(opts as any)
+
+    // 第二次必须与第一次返回同一条直链
+    assert.equal(second.url, first.url, "二次调用应命中缓存返回同一 URL")
+
+    // 关键断言：网络往返数完全没有增长
+    assert.deepEqual(
+      { ...calls, fetchCount },
+      afterFirst,
+      `缓存命中不应产生任何网络往返，实际变化: ${
+        JSON.stringify({ ...calls, fetchCount })
+      } vs ${JSON.stringify(afterFirst)}`,
+    )
+  } finally {
+    globalThis.fetch = realFetch
+    clearCasLinkCache()
+  }
+})
+
+test("直链缓存必须走 KV 共享（仅内存 Map 在 CF 上无效）", async () => {
+  // ⚠️ 这是本缓存实现的**核心回归点**，用血泪换来：
+  //
+  // 最初用模块级 `Map` 做缓存，实测**完全无效** —— 同一 URL 连打 10 次
+  // HEAD，耗时 3.3/4.2/5.0/8.3/9.0/10.0/11.6/12.8/13.2 秒，毫无收敛趋势。
+  // 原因是 CF Workers 按负载把请求分散到**多个 isolate**，模块级状态
+  // 不跨 isolate 共享，于是"刚写入的直链"下次请求根本读不到。
+  //
+  // 因此契约是：缓存**必须**读写 KV（KV 在所有 isolate / 边缘节点间一致），
+  // 内存 Map 只能作为一级加速层存在。
+  const { client, casContent } = makeCountableClient()
+
+  // 打桩一个最小 KV，记录读写次数
+  const kvCalls = { get: 0, put: 0 }
+  const store = new Map<string, string>()
+  const fakeKv = {
+    async get(key: string) {
+      kvCalls.get++
+      return store.get(key) ?? null
+    },
+    async put(key: string, value: string) {
+      kvCalls.put++
+      store.set(key, value)
+    },
+  }
+  const db: any = await import("../../../internal/model/db")
+  const realEnv = db.getEnvCtx()
+  db.setEnvCtx({ ...(realEnv || {}), KV: fakeKv } as any)
+
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(casContent, { status: 200 })) as any
+
+  try {
+    clearCasLinkCache()
+    await resolveCasPlayLink({
+      client,
+      rootId: "/",
+      casFileId: "cas-kv-1",
+      casName: "movie.mkv.cas",
+      autoCleanup: false,
+    } as any)
+
+    // 首次：链路跑完后必须把直链写进 KV
+    assert.ok(kvCalls.put >= 1, `首次播放后应向 KV 写入直链，实际 put=${kvCalls.put}`)
+
+    // 清掉内存一级缓存，模拟"请求被分派到另一个 isolate"
+    clearCasLinkCache()
+    const before = { ...kvCalls }
+
+    await resolveCasPlayLink({
+      client,
+      rootId: "/",
+      casFileId: "cas-kv-1",
+      casName: "movie.mkv.cas",
+      autoCleanup: false,
+    } as any)
+
+    assert.ok(
+      kvCalls.get > before.get,
+      `跨 isolate 必须回落到 KV 读取，实际 get 增量=${kvCalls.get - before.get}`,
+    )
+  } finally {
+    globalThis.fetch = realFetch
+    clearCasLinkCache()
+    db.setEnvCtx(realEnv as any)
+  }
+})
+
+test("resolveCasPlayLink 失败结果绝不进缓存", async () => {
+  // 若把失败也缓存，用户会在 TTL 内**持续**拿到不可播放的直链，
+  // 且要等 10 分钟才自愈 —— 比不缓存更糟。此处锁定该契约。
+  clearCasLinkCache()
+
+  const client: any = {
+    async getDownloadUrl() {
+      throw new Error("cdc down")
+    },
+  }
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response("boom", { status: 500 })) as any
+
+  try {
+    await assert.rejects(
+      () =>
+        resolveCasPlayLink({
+          client,
+          rootId: "/",
+          casFileId: "cas-fail",
+          casName: "movie.mkv.cas",
+          autoCleanup: false,
+        } as any),
+      /step=read/,
+      "读 CAS 失败应抛 CasPlayError 且带 step 标记",
+    )
+  } finally {
+    globalThis.fetch = realFetch
+    clearCasLinkCache()
+  }
+})
+
+/* ------------------ 临时副本复用（TEMP 堆积的根因） ------------------ */
+
+test("播放恢复必须优先复用 TEMP 里已有的同名副本（否则每次新建一份）", async () => {
+  // 真实故障（2026-09-18 线上，TEMP 目录堆了 11 个同名副本）：
+  //
+  // 播放器起播探测 / 拖动 / 分段 Range 会对同一个 .cas 反复请求，
+  // 每次请求都跑一遍秒传恢复 → 在 TEMP 里**新建一个副本**。
+  // 而请求级清理（waitUntil 120s）因 ctx 未注入而从不执行，
+  // cron 又要等下一小时 —— 副本就这样堆积起来。
+  //
+  // 连锁后果：① 每次请求都真跑秒传恢复，耗时稳定 7~12 秒；
+  //          ② TEMP 膨胀使 listFiles 变慢，最终拖死请求（120s 超时 / 503）。
+  //
+  // 契约：TEMP 中已存在「前缀合规 + 后缀同名」的副本时，必须直接复用，
+  //       不得再调用秒传恢复接口。
+  const realName = "冰川时代：幸存的希德.2008.mkv"
+  const calls = { rapid: 0 }
+  const reusedId = "existing-copy-id"
+
+  const client: any = {
+    // readCasContent 会先取一次 .cas 自身直链再 fetch（fetch 已被打桩）
+    async getDownloadUrl() {
+      return "https://example.invalid/cas.cas"
+    },
+    async listFiles(id: string) {
+      if (id === "TEMP_ID") {
+        return {
+          folders: [],
+          files: [
+            {
+              contentID: reusedId,
+              contentName: `TEMP_139CAS_1789709748945_y3cl59_${realName}`,
+            },
+          ],
+        }
+      }
+      return {
+        folders: [{ catalogName: "TEMP", catalogID: "TEMP_ID" }],
+        files: [],
+      }
+    },
+    async request(path: string) {
+      if (path.includes("rapid")) calls.rapid++
+      return { data: {} }
+    },
+  }
+
+  const content = encodeCas({
+    name: realName,
+    size: 1024 * 1024,
+    sha256: "a".repeat(64),
+  } as any)
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(content, { status: 200 })) as any
+
+  try {
+    const link = await resolveCasPlayLink({
+      client,
+      rootId: "/",
+      casFileId: "cas-reuse-1",
+      casName: `${realName}.cas`,
+      autoCleanup: false,
+    } as any)
+
+    assert.equal(
+      calls.rapid,
+      0,
+      `TEMP 已有同名副本时必须复用，不得再走秒传恢复（实际调用 ${calls.rapid} 次）`,
+    )
+    assert.equal(
+      link.tempDirId,
+      "TEMP_ID",
+      "复用路径也要回传 tempDirId，供后续请求继续复用",
+    )
+  } finally {
+    globalThis.fetch = realFetch
+    clearCasLinkCache()
+  }
+})
+
+test("必须注入 __cas_ctx__ 供临时副本延迟清理（否则 waitUntil 恒被丢弃）", async () => {
+  // `scheduleCleanup()` 读的是 `globalThis.__cas_ctx__`，取值恒 undefined 时
+  // 会走 else 分支把任务直接丢掉 —— 这就是"清理从不生效"的直接原因。
+  // 契约：请求中间件必须把 Hono 的 executionCtx 挂到该全局上。
+  const src = await import("node:fs/promises").then((fs) =>
+    fs.readFile(new URL("../../../index.ts", import.meta.url), "utf8"),
+  )
+  assert.ok(
+    /__cas_ctx__/.test(src),
+    "index.ts 必须在请求入口注入 __cas_ctx__（否则请求级清理永不执行）",
+  )
+  assert.ok(
+    /executionCtx/.test(src),
+    "应通过 Hono 的 c.executionCtx 取 ExecutionContext",
+  )
 })

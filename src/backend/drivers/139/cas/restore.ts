@@ -191,6 +191,60 @@ export async function ensureTempDir(
 }
 
 /**
+ * 在临时目录里寻找**已存在的同名副本**并复用。
+ *
+ * ## 为什么必须做这件事（真实故障根因）
+ *
+ * 播放器起播探测 / 拖动 / 分段 Range 会对**同一个** `.cas` 反复请求，
+ * 每次请求都跑一遍「秒传恢复」→ 在 TEMP 里**新建一个副本**。
+ * 而副本清理依赖 worker 的定时任务（`sweepTempFilesAll`），
+ * 请求级 `waitUntil` 只保约 30 秒、远短于 120 秒的清理延迟，
+ * 所以清理**实际不生效**。
+ *
+ * 实测后果（2026-09-18 线上）：连打 6 次 `fs/get`，TEMP 里堆了 **11 个**
+ * 同名副本。这带来两个连锁问题：
+ *
+ *   1. 每次请求都要真跑一遍秒传恢复，耗时稳定在 **7~12 秒**；
+ *   2. TEMP 目录持续膨胀，`listFiles` 越来越慢，最终拖死请求 ——
+ *      表现为客户端 **120 秒超时**，以及边缘节点判定子请求/CPU 超限后的 **503**。
+ *
+ * 秒传恢复本身是幂等的（同一 sha256 + size 得到的永远是同一份内容），
+ * 因此**完全可以复用已有副本**，无需每次新建。
+ *
+ * ## 匹配策略
+ *
+ * 只认「去掉滚动前缀后名字完全相同」的副本。TEMP 里的副本形如
+ * `TEMP_139CAS_1789709748945_y3cl59_冰川时代：幸存的希德.2008.mkv`，
+ * 校验真实后缀即可与别的文件区分开，不会误用他人的副本。
+ *
+ * 找不到（或列举失败）返回 null，由调用方照常走新建流程 ——
+ * 复用只是优化，绝不能因为它出错而让播放失败。
+ */
+async function findReusableTempCopy(
+  client: Yun139ApiClient,
+  tempDirId: string,
+  realName: string,
+): Promise<{ fileId: string; fileName: string } | null> {
+  try {
+    const { files } = await client.listFiles(tempDirId)
+    // 从新到旧找：同名的多个副本内容一致，但新的更可能仍被播放在引用
+    for (let i = files.length - 1; i >= 0; i--) {
+      const f = files[i]
+      const name = f.contentName || ""
+      if (!name.endsWith(realName)) continue
+      const prefix = name.slice(0, name.length - realName.length)
+      // 只接受本模块生成的滚动前缀，避免把「别的同名文件」当成本文件的副本
+      if (!/^TEMP_139CAS_\d+_[a-z0-9]+_$/.test(prefix)) continue
+      if (!f.contentID) continue
+      return { fileId: f.contentID, fileName: name }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
  * 从 CAS 元数据恢复真实文件到云端。
  *
  * @param tempPrefix 传入前缀表示创建临时副本（播放场景），否则恢复为正式文件
@@ -207,6 +261,18 @@ export async function restoreFromCas(
 
   if (!meta.sha256) {
     throw new Error("该 CAS 文件未记录 SHA256，无法秒传恢复（可能是旧版工具生成）")
+  }
+
+  // 播放场景（带 tempPrefix）：先找可复用的副本，命中就省下一次秒传恢复。
+  //
+  // 这是**播放提速的关键一步** —— 直链缓存（cas/player.ts）只在 KV 传播到
+  // 当前边缘节点后才生效，冷启动时依赖不上；而这里的复用是**同一请求内
+  // 一定成立的**，直接砍掉一轮「建副本」往返。两者互补：
+  //   直链缓存 → 跨请求复用（快，但有 KV 传播延迟）
+  //   副本复用 → 请求内/跨请求兜底（稳，只需一次 listFiles）
+  if (tempPrefix) {
+    const reusable = await findReusableTempCopy(client, parentFileId, realName)
+    if (reusable) return reusable
   }
 
   // 秒传只需要 hash 与大小，但目标目录必须是**当前有效**的目录。

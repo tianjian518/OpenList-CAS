@@ -6,6 +6,7 @@ import { webdavRouter } from "./server/webdav"
 import { s3Router } from "./server/s3"
 import { setEnvCtx } from "./internal/model/db"
 import { getStoreConfigError } from "./internal/model/store/backend"
+import { resetPathIndexRequestBudget } from "./drivers/139/pathindex"
 
 const app = new Hono()
 
@@ -67,6 +68,53 @@ app.use("*", async (c, next) => {
   }
 
   setEnvCtx(env)
+
+  // ── 注入 Workers 的 ExecutionContext，供 CAS 临时副本"请求级"清理使用 ──
+  //
+  // CAS 播放会在 139 的 TEMP 目录里创建一个临时副本，正常应由
+  // `waitUntil()` 在 120 秒后删掉。但此前**没有任何地方给
+  // `globalThis.__cas_ctx__` 赋值**，所以 cas/player.ts 里的
+  // `scheduleCleanup()` 每次都走 else 分支，任务被直接丢弃：
+  //
+  //   const ctx = (globalThis as any).__cas_ctx__   // 恒为 undefined
+  //   if (ctx && typeof ctx.waitUntil === "function") { ... } else { task.catch(()=>{}) }
+  //
+  // 实测后果（2026-09-18 线上）：连打 6 次 fs/get，TEMP 里堆了 **11 个**
+  // 同名副本。TEMP 持续膨胀会让 listFiles 越来越慢，最终拖死请求 ——
+  // 客户端表现为 **120 秒超时**，边缘节点表现为子请求/CPU 超限的 **503**。
+  // 手动清理确实能临时缓解，所以现象看起来像"偶发"，实际是必然累积。
+  //
+  // Hono 已把 `c.executionCtx` 暴露出来，直接挂上去即可。
+  // 注意：非 Workers 环境（本地 Node / 测试）没有该属性，取不到时忽略，
+  // 清理仍由 worker 的 cron（sweepTempFilesAll）兜底。
+  try {
+    const ctx = (c as any).executionCtx
+    if (ctx) (globalThis as any).__cas_ctx__ = ctx
+  } catch {
+    // 忽略：无 ExecutionContext 时依赖定时任务清理
+  }
+
+  // ── 归还上一次请求遗留的 139 路径索引读取预算 ──────────────────────────
+  //
+  // `kvLoadsThisRequest` / `kvAttemptedKeys` 是 pathindex 模块的**模块级**变量，
+  // 而 CF Workers 的 isolate 会跨请求复用 —— 它们天然是「请求级」语义，
+  // 必须每个请求重置一次。
+  //
+  // 此前只在 `flushPendingDriverState()`（unused 驱动用完的 finally 里）
+  // 才重置，覆盖不全：访问非 139 存储、前端静态资源、早期 4xx 返回、
+  // 或驱动抛异常提前退出的请求，都走不到那里。于是计数只增不减，
+  // 很快触发 `kvLoadsThisRequest >= MAX_KV_LOADS_PER_REQUEST` 上限，
+  // 此后**所有** 139 请求都读不到路径索引 → 退化为逐层向 139 发请求 →
+  // 深层目录单次 PROPFIND 从 ~2s 劣化到 10s+ → 撞上 Workers 的子请求/CPU
+  // 上限被边缘节点拒绝，这正是线上偶发 **503** 的成因。
+  //
+  // 放在请求最前面（而非收尾）是有意为之：**入口重置是幂等的**，
+  // 它不依赖任何前置条件，也就不存在"某条分支忘记重置"的可能。
+  try {
+    resetPathIndexRequestBudget()
+  } catch {
+    // 忽略：预算是纯优化手段，重置失败不应影响请求本身
+  }
 
   // 存储配置错误全局拦截：任何依赖持久化的 API 都应立即得到明确错误，
   // 而不是静默退回内存模式（表现为「操作成功但数据丢失」）。

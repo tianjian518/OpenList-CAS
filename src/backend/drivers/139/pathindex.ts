@@ -29,6 +29,39 @@
 const KV_PREFIX = "opencas_139_idx_"
 
 /**
+ * 索引读 KV 的超时（毫秒）。
+ * 索引是几十 KB 的大 key，CF KV 冷读要回源中心存储，可能长时间不返回；
+ * 没有超时会挂死整个请求，超了就降级为无索引。
+ *
+ * ## 为什么从 3000 降到 800
+ *
+ * 这是一个**纯优化手段**的超时，代价必须小于收益：
+ *   - 命中索引：省下「逐层向 139 发请求」的 N 次往返（深层目录约 3~8 秒）；
+ *   - 未命中/超时：退化为原本的逐层解析，只是白等了这么久。
+ *
+ * KV 边缘缓存命中时通常 10~50ms 返回，800ms 已有充足余量；而 3 秒的旧值
+ * 意味着**每次冷读都要先干等 3 秒**才开始真正的解析 —— 这正是实测中
+ * 深层目录 PROPFIND 稳定耗时 4~10 秒、并发时冲到 15 秒的元凶之一，
+ * 也是把请求推向 Workers CPU/子请求上限（表现为 503）的直接原因。
+ */
+const KV_INDEX_TIMEOUT_MS = 800
+
+/** 给 Promise 套一层超时，超时抛错（调用方 catch 后降级） */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: any
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
  * 单个存储的索引条目数上限。
  * 超出后按 `ts`（最近使用时间）淘汰最旧的，防止 KV 单值无限膨胀。
  */
@@ -55,8 +88,23 @@ const KV_BINDING_TTL_MS = 60_000
 /** 本请求已尝试读取的 storageKey（同一请求内不重复读同一个键） */
 const kvAttemptedKeys = new Set<string>()
 
-/** 单次请求最多读取几个 KV 索引键 */
-const MAX_KV_LOADS_PER_REQUEST = 2
+/**
+ * 单次请求最多读取几个 KV 索引键。
+ *
+ * ⚠️ 这个额度**必须够用**，否则索引会静默失效（真实 BUG）。
+ *
+ * 去重语义已由 `kvAttemptedKeys` 保证（同一 storageKey 在本请求内最多读一次），
+ * 所以本计数只在「一次请求真的访问了多个不同存储」时才起作用。
+ *
+ * 原值 2 太小：同一次解析里 `lookupPathId`（查目标路径）、
+ * `resolveFromDeepestKnown → lookupFirstHit`（查最深已知前缀）、
+ * `loadIndexOnce`（取整表）三处都会读，2 次额度在第一处就被吃掉，
+ * 后面的调用全部直接 `return null` → 退化成逐层向 139 发请求 → 慢 → 503。
+ *
+ * 对绝大多数部署（单存储），去重后实际只读 1 次；调大不会增加配额消耗，
+ * 只是给「一账号挂多个存储」的场景留出余量。
+ */
+const MAX_KV_LOADS_PER_REQUEST = 6
 
 /** 本请求已消耗的 KV 读取额度 */
 let kvLoadsThisRequest = 0
@@ -165,7 +213,13 @@ async function kvLoad(
   const binding = await getBinding(env)
   if (!binding) return null
   try {
-    const raw = await binding.get(`${KV_PREFIX}${storageKey}`)
+    // 【超时兜底】索引是 45KB 的大 key，CF KV 边缘缓存未命中时要回源中心存储，
+    // 没有超时会无限挂起、拖死整个 PROPFIND（实测线上 57% 请求卡死十几秒）。
+    // 索引只是加速手段，读不到就退化成「无索引」路径，绝不能让它拖垮请求。
+    const raw = await withTimeout(
+      binding.get(`${KV_PREFIX}${storageKey}`),
+      KV_INDEX_TIMEOUT_MS,
+    )
     if (!raw) return null
     const parsed = JSON.parse(typeof raw === "string" ? raw : String(raw))
     if (!parsed || typeof parsed !== "object") return null
@@ -175,7 +229,17 @@ async function kvLoad(
   }
 }
 
-/** 回写索引到 KV（尽力而为，失败静默） */
+/**
+ * 回写索引到 KV（尽力而为，失败静默）。
+ *
+ * ⚠️ **`put` 必须限时**：索引是 ~45KB 的大 key，而 `flushPathIndex()` 会被
+ * 驱动的 `close()` **在请求内 await**（不是后台 waitUntil）。一旦 KV 写入
+ * 挂起，整个请求就被拖住，直到 CF 平台在 95 秒左右硬杀 —— 客户端看到
+ * `http=000 t=95.000s`，而因为**每次 139 调用本身都很快**，
+ * 任何针对网络请求的超时都不会触发，排查时极易被误导。
+ *
+ * 索引回写纯属优化（丢了最多下次重新解析一遍），因此超时后直接放弃。
+ */
 async function kvSave(
   storageKey: string,
   map: Record<string, PathIndexEntry>,
@@ -184,7 +248,10 @@ async function kvSave(
   const binding = await getBinding(env)
   if (!binding) return
   try {
-    await binding.put(`${KV_PREFIX}${storageKey}`, JSON.stringify(map))
+    await withTimeout(
+      Promise.resolve(binding.put(`${KV_PREFIX}${storageKey}`, JSON.stringify(map))),
+      KV_INDEX_TIMEOUT_MS,
+    )
   } catch {
     // 忽略：写失败下次还会重试
   }
@@ -242,11 +309,33 @@ export async function flushPathIndex(env?: any): Promise<void> {
  * **必须在每个请求的收尾调用**，否则计数跨请求累积，
  * 之后所有请求都不再读 KV，索引退化为纯内存（等于失效）。
  *
- * 注意只重置计数、**不重置 `kvAttemptedKeys`**：
- * 去重集合按 storageKey 记录，同一请求内重复访问同一存储本就不该重复读 KV。
+ * ⚠️ **`kvAttemptedKeys` 也必须一起清空（真实 BUG，线上 503 的主因之一）**
+ *
+ * 这两个集合/计数都是**模块级**变量，而 Cloudflare Workers 的 isolate 会被
+ * **跨请求复用**。此前只重置了计数、按注释刻意保留 `kvAttemptedKeys`，理由是
+ * 「同一请求内重复访问同一存储不该重复读 KV」—— 这个理由只在「同一个请求内」
+ * 成立，但变量活得更久：
+ *
+ *   请求 A：resolve("1") → kvAttemptedKeys = {"1"}
+ *   请求 B（同一 isolate，几毫秒后）→ kvLoad() 首行 has("1")===true → 直接 return null
+ *   请求 C、D、E… → 同样直接 return null
+ *
+ * 即**从第一个请求之后，该 isolate 内的路径索引就彻底不再从 KV 加载**。
+ * 后果不是报错，而是静默劣化：每次列目录都退化成「逐层向 139 发请求」，
+ * 深层目录的单次 PROPFIND 从 ~2s 涨到 10s+（实测并发下 15s），
+ * 最终撞上 Workers 的**子请求 / CPU 上限而被边缘节点拒绝 —— 这就是 503**。
+ *
+ * 之所以此前没被发现：单看一次请求永远是对的（同一请求内确实只读一次），
+ * 只有连续多次请求才会暴露；且它表现为「偶尔卡、偶尔 503」，极易被当成
+ * 网络抖动。
+ *
+ * 清空是安全的：真正需要「请求内去重」的语义由调用时机保证 ——
+ * 本函数在每个请求收尾被调用一次，清空后下个请求自然从零开始，
+ * 同一请求内仍然只会读一次同一个 key。
  */
 export function resetPathIndexRequestBudget(): void {
   kvLoadsThisRequest = 0
+  kvAttemptedKeys.clear()
 }
 
 /** 查一次索引（先内存后 KV），未命中返回 null */
@@ -301,20 +390,62 @@ export async function lookupFirstHit(
   return null
 }
 
-/** 取整个索引表：内存优先，其次 KV，都没有则建空表 */
+/**
+ * 取整个索引表：内存优先，其次 KV，都没有则建空表。
+ *
+ * ⚠️ **不能因为内存里有表就直接返回（真实 BUG，索引静默失效的第二个原因）**
+ *
+ * `memoryIndex` 是模块级变量，而 CF Workers 的 isolate 跨请求复用。
+ * `rememberPathId` / `rememberChildren` 每次都会 `memEnsure()` 建表，
+ * 于是「某次请求只来得及登记一个新路径」就会留下一个**几乎空的内存表**。
+ *
+ * 旧写法 `if (mem) return mem` 会让这个空表**永久生效**：
+ *
+ *   请求 A：解析深层路径失败，只登记了 1 条 → memoryIndex[key] = {1 条}
+ *   请求 B：loadIndexOnce() → mem 有值（那 1 条）→ 直接返回
+ *   请求 C、D、E… → 同上，**KV 里那几千条索引再也不会被读出来**
+ *
+ * 结果与 `kvAttemptedKeys` 那个 bug 表现完全一致：逐层解析 → 慢 → 503。
+ * 两者叠加时尤其难以定位，因为单看每个函数都很"合理"。
+ *
+ * 正确做法：内存表**条目很少**时（说明它只是残渣，不是完整索引），
+ * 仍要去 KV 尝试合并一次；KV 结果按「内存优先」合并，不覆盖较新的记录。
+ */
 async function loadIndexOnce(
   storageKey: string,
   env?: any,
 ): Promise<Record<string, PathIndexEntry>> {
   const mem = memGet(storageKey)
-  if (mem) return mem
+
+  // 内存表已足够"厚"（说明本 isolate 确实加载过完整索引），直接用
+  if (mem && Object.keys(mem).length >= MIN_LOADED_INDEX_ENTRIES) return mem
+
   const fromKv = await kvLoad(storageKey, env)
   if (fromKv) {
+    if (mem) {
+      // 内存优先：只补 KV 里有、内存里没有的键
+      for (const k of Object.keys(fromKv)) {
+        if (!mem[k]) mem[k] = fromKv[k]
+      }
+      return mem
+    }
     memoryIndex.set(storageKey, fromKv)
     return fromKv
   }
-  return memEnsure(storageKey)
+  return mem || memEnsure(storageKey)
 }
+
+/**
+ * 「内存索引可信任」的最小条目数。
+ *
+ * 低于此值时认为内存里只攒了零星几条（isolate 刚启动、或上次请求只
+ * 登记了一两个路径），不足以代表 KV 中的完整索引，必须回源 KV 合并。
+ *
+ * 取值权衡：太小则每个请求都可能多读一次 KV（KV 读有配额）；
+ * 太大则迟迟不信任内存、每次都读 KV。8 条足够区分「残渣」与
+ * 「确实加载过索引」—— 正常浏览一次目录就会登记几十条以上。
+ */
+const MIN_LOADED_INDEX_ENTRIES = 8
 
 /** 记录单个路径 → ID 的映射 */
 export function rememberPathId(

@@ -441,10 +441,43 @@ export async function isPersistentStorageAvailable(env?: any): Promise<boolean> 
   return isPersistentStatus(status)
 }
 
-/** 存储状态查询，任何异常都折叠成「不可用」状态而非抛出。 */
+/**
+ * 存储状态查询，任何异常都折叠成「不可用」状态而非抛出。
+ *
+ * ## ⚠️ 超时保护是必须的（2026-09-18 线上全站 API 卡死的根因）
+ *
+ * 本函数被 `getStoreConfigError()` 调用，而后者位于
+ * `index.ts` 的**全局中间件**里 —— 也就是说**每个非静态 API 请求都要过这里**。
+ *
+ * `getStoreStatus()` 会做真实的健康检查（KV 驱动时是一次 KV 读）。
+ * 之前这里**没有任何超时**，于是：KV 读一旦挂起
+ * （实测线上确实发生），**所有 API 请求全部卡到平台硬杀**：
+ *
+ *   - `GET /`（静态壳）正常 1~3 秒 ✅
+ *   - `GET /api/public/settings`（过中间件）静默挂死 95.000 秒 ❌
+ *   - 连 `/api/auth/login` 都卡死 —— 与 139 驱动、与 CAS 链路完全无关
+ *
+ * 这个现象极具迷惑性：看起来像"139 慢"或"CAS 播放卡"，
+ * 实际上**所有** API 都在同一条中间件路径上被拖死。
+ * 之所以 `http=000` 且耗时整齐地停在 95 秒，是 CF 平台在硬杀请求。
+ *
+ * 这里给状态查询设 3 秒上限：健康检查只是**判断依据**，
+ * 超时即视为"状态未知"，折叠成不可用（保持原有容错语义），
+ * 绝不能让它把整个请求拖死。
+ */
 async function getStorageStatusSafe(env?: any): Promise<any> {
+  const STATUS_TIMEOUT_MS = 3000
+  let timer: any
   try {
-    return await getStoreStatus(env)
+    return await Promise.race([
+      getStoreStatus(env),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`存储状态检查超时（${STATUS_TIMEOUT_MS}ms）`)),
+          STATUS_TIMEOUT_MS,
+        )
+      }),
+    ])
   } catch (err: any) {
     return {
       driver: "none",
@@ -452,6 +485,9 @@ async function getStorageStatusSafe(env?: any): Promise<any> {
       available: false,
       configError: String(err?.message || err),
     }
+  } finally {
+    // isolate 跨请求复用，计时器必须清掉，避免长期驻留反复触发
+    if (timer) clearTimeout(timer)
   }
 }
 

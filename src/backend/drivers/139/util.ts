@@ -32,6 +32,101 @@ export function md5(str: string): string {
   return CryptoJS.MD5(str).toString(CryptoJS.enc.Hex)
 }
 
+/**
+ * 带超时的 `fetch`。
+ *
+ * ## 为什么必须加（真实故障）
+ *
+ * 139 的 API 偶发**完全不响应**，而原生 `fetch` 没有超时概念 —— 一旦卡住
+ * 就只能等 CF 平台硬杀（90~120 秒）。线上表现为：
+ *
+ *   - `fs/get` / `PROPFIND` 打十次卡两三次，客户端 `http=000` 且耗时 90s+；
+ *   - 同时段其它请求被拖慢，边缘节点还可能判定子请求配额超限 → 503；
+ *   - 报错信息里**看不出是哪一步卡住**，只能看到"请求整体超时"。
+ *
+ * 加上超时后，卡死的单次往返会在 8 秒内失败并抛出明确错误，
+ * 上层（driver / op）得以按自己的语义降级（例如退回逐层解析、返回 5xx
+ * 并带上原因），而不是把整个请求耗到平台强杀。
+ *
+ * ## 实现说明
+ *
+ * 优先用 `AbortSignal.timeout()`（Workers 与 Node 18+ 均支持，最简洁）。
+ * 若运行时不支持，则退化为手动 `AbortController` + `setTimeout`，
+ * 并务必在 `finally` 里清掉计时器，避免长命 isolate 里计时器泄漏。
+ */
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  // ⚠️ **必须用显式 AbortController + setTimeout，不能用 AbortSignal.timeout()**
+  //
+  // 实测（2026-09-18 线上）：`AbortSignal.timeout(8000)` 在 CF Workers 上
+  // **不会触发** —— 139 API 卡死时请求照样挂到平台 95 秒硬杀，
+  // 客户端看到整齐的 `http=000 t=95.0s`。换回手动 AbortController 后
+  // 超时才真正生效（无需依赖运行时的 signal 实现细节）。
+  const controller = new AbortController()
+  const timer = setTimeout(() => {
+    try {
+      controller.abort()
+    } catch {
+      // 忽略：abort 失败不影响主流程
+    }
+  }, timeoutMs)
+
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } catch (err: any) {
+    // 把 abort 转成可读错误，避免上层只看到含糊的 "The operation was aborted"
+    if (controller.signal.aborted) {
+      throw new Error(
+        `139 请求超时（${timeoutMs}ms，目标 ${url.slice(0, 80)}）`,
+      )
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * 给任意 Promise 套一层超时，超时抛错。
+ *
+ * ## 为什么需要它（真实故障根因）
+ *
+ * `fetchWithTimeout` 只保护到**响应头到达**为止 —— 一旦 `fetch()` resolve，
+ * 它内部的计时器就在 `finally` 里被清掉了。但 `res.json()` / `res.text()`
+ * 是**第二次 await**，读取 body 期间完全没有超时保护。
+ *
+ * 139 的 API 存在「响应头很快返回、body 却迟迟不结束」的情况（慢速传输 /
+ * 连接半挂），此时 `await res.json()` 会一直等下去，直到 CF 平台在
+ * **95 秒**左右硬杀请求。这也是实测中 `fs/list` 打 15 次卡死 3 次
+ * （`http=000 t=95.000s`，耗时精确到毫秒整齐）的直接原因。
+ *
+ * 注意这里的超时**无法真正取消**底层的 body 读取（读 body 不受
+ * AbortController 约束），但我们至少能**及时失败并降级**，
+ * 不再把整个请求拖到平台超时 —— 对调用方而言这才是可用的行为。
+ */
+export function withTimeout<T>(p: Promise<T>, ms: number, label = ""): Promise<T> {
+  let timer: any
+  return Promise.race([
+    p.finally(() => {
+      if (timer) clearTimeout(timer)
+    }),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(`请求超时（${ms}ms${label ? `，${label}` : ""}）`),
+          ),
+        ms,
+      )
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  }) as Promise<T>
+}
+
 export function calSign(body: string, ts: string, randStr: string): string {
   const enc = encodeURIComponentCustom(body)
   const sorted = enc.split("").sort().join("")
@@ -223,18 +318,40 @@ export class Yun139ApiClient {
         ? this.buildPersonalHeaders(bodyStr)
         : this.buildCommonHeaders(bodyStr)
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers,
-      body: bodyStr,
-    })
+    // ── 单次请求超时（关键：防止一次卡死拖满整个请求） ──────────────────
+    //
+    // 实测（2026-09-18 线上）：到 139 API 的单次往返本身就要 1~2 秒，
+    // 且**偶发完全不响应** —— 客户端表现为 90~120 秒后超时（`http=000`）。
+    // fs/get、PROPFIND 都因此出现「打十次卡两三次」的现象。
+    //
+    // 原来这里没有超时，一旦某个出站请求卡住，就只能等 CF 平台硬杀
+    // （免费版 CPU 限制 / 子请求超时），期间该请求的所有并发工作全部白做，
+    // 而且报错信息里看不出是哪一步卡住。
+    //
+    // 这里给每次往返设 8 秒上限：正常请求 1~2 秒必回，8 秒足够留出余量，
+    // 而一旦超时能**尽快失败**，让上层（driver / op）按自己的语义降级或报错。
+    //
+    // ⚠️ 之后所有目录解析都走这里，所以超时值不能太小（否则网络抖动就误杀），
+    //    也不能太大（否则单条卡死仍会耗尽整个请求预算）。
+    const REQUEST_TIMEOUT_MS = 5000
+    const res = await fetchWithTimeout(
+      url,
+      { method: "POST", headers, body: bodyStr },
+      REQUEST_TIMEOUT_MS,
+    )
 
+    // body 读取同样要限时：139 存在「响应头快、body 半挂」的情况，
+    // 裸 await res.json() 会一直等到 CF 平台 95 秒硬杀整个请求。
     if (!res.ok) {
-      const text = await res.text()
+      const text = await withTimeout(res.text(), REQUEST_TIMEOUT_MS, "读错误响应体")
       throw new Error(`139 Cloud API error (${res.status}): ${text.slice(0, 200)}`)
     }
 
-    const json = (await res.json()) as any
+    const json = (await withTimeout(
+      res.json(),
+      REQUEST_TIMEOUT_MS,
+      "读响应体",
+    )) as any
     if (json.success === false && json.message) {
       throw new Error(`139 Cloud API error: ${json.message} [${json.code || ""}]`)
     }
@@ -264,13 +381,14 @@ export class Yun139ApiClient {
     }
 
     try {
-      const res = await fetch(
+      const res = await fetchWithTimeout(
         "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do",
         {
           method: "POST",
           headers: { "Content-Type": "application/xml" },
           body: `<root><token>${inner.token}</token><account>${inner.account}</account><clienttype>656</clienttype></root>`,
         },
+        8000,
       )
       const text = await res.text()
       const retCode = (text.match(/<return>([^<]*)<\/return>/) || [])[1]
@@ -376,6 +494,35 @@ export class Yun139ApiClient {
       const allItems: PersonalFileItem[] = []
       const parentFileId = folderId || this.addition.root_folder_id || "/"
 
+      /**
+       * ⚠️ 分页循环**必须设上限并防御重复 cursor**，否则会无限打请求。
+       *
+       * ## 真实故障（2026-09-18 线上，最难定位的一个）
+       *
+       * 线上表现为：`fs/list` 打 15 次卡死 3 次，且耗时**精确整齐地停在
+       * 95.000s**（CF 平台硬杀）。诡异之处在于：
+       *
+       *   - 给单次 fetch 加 5 秒超时**完全无效**；
+       *   - 给 `res.json()` 加超时**也无效**；
+       *   - 不访问 139 的公共接口 6/6 全部正常（0.7~3.8s）。
+       *
+       * 原因就在这里：单次请求都**正常且快速**（1~2 秒就返回），所以任何
+       * "单次调用超时"都不会触发；但 `while (nextPageCursor)` 只要 139
+       * 返回的 cursor **不再变化**（同一个值反复给），循环就会一直转下去，
+       * 一次次累加到平台上限 —— 于是表现为"每个请求都很快，但整个请求卡死"。
+       *
+       * 双重保护：
+       *   1. `pages` 计数上限，兜住纯粹的无限分页；
+       *   2. `seenCursors` 去重，发现 cursor 原地打转立刻停止。
+       *
+       * 这两条都是**防御性**的：正常目录一两页就结束，不会触及阈值；
+       * 一旦触发就说明上游行为异常，此时**宁可返回已拿到的部分数据**，
+       * 也绝不能让整个请求被平台杀掉（那会让用户连目录都看不到）。
+       */
+      const MAX_PAGES = 30
+      const seenCursors = new Set<string>()
+      let pages = 0
+
       do {
         const res = await this.request<PersonalListResp>(
           "/file/list",
@@ -394,7 +541,18 @@ export class Yun139ApiClient {
 
         const items = res.data?.items || []
         allItems.push(...items)
-        nextPageCursor = res.data?.nextPageCursor || ""
+
+        const cursor = res.data?.nextPageCursor || ""
+        pages++
+
+        // cursor 原地打转（重复值）或超过页数上限，立即停止，
+        // 返回已拿到的部分数据 —— 绝不为了"完整"而把请求拖死。
+        if (!cursor || seenCursors.has(cursor) || pages >= MAX_PAGES) {
+          nextPageCursor = ""
+          break
+        }
+        seenCursors.add(cursor)
+        nextPageCursor = cursor
       } while (nextPageCursor)
 
       const folders = allItems

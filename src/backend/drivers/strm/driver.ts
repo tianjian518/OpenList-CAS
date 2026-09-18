@@ -266,7 +266,36 @@ export class StrmDriver implements StorageDriver {
    */
   private async getLink(path: string): Promise<string> {
     let finalPath = path
-    if (this.addition.encodePath) finalPath = this.encodePath(path)
+    // ── 路径**无条件**编码（`encodePath` 配置项已废弃）────────────────────
+    //
+    // 【为什么必须编码】
+    // `.strm` 是一行纯文本，播放器（网易爆米花 / Emby / Kodi / Infuse）拿到后
+    // 是**照字面**去请求的，不会替我们做转义。而片名里空格、`()[]{}` 几乎必然
+    // 存在，例如：
+    //
+    //   .../华语电影/喜宴 (1993) {tmdb-9261}/喜宴 (1993) {tmdb-9261} [1080p H.265 DD 2.0].mkv.cas
+    //
+    // 含裸空格与花括号的 URL 属于**非法 URI**，播放器在解析阶段就失败，
+    // 用户看到的现象正是「WebDAV 地址不对 / 打不开」。实测同一路径：
+    // 未编码时 curl 直接拒绝发送；编码后 HTTP 200，签名校验同样通过
+    // （验签侧 `reqPath` 来自 Hono 已解码的路径，两边一致）。
+    //
+    // 【为什么不再看配置】
+    // 此处原先按 `this.addition.encodePath` 开关决定，有三个致命问题：
+    //
+    //   1. 该开关取 false 时**必然产出非法 URL**，不存在任何合法用途 ——
+    //      它不是"特性"，而是"关掉之后全是坏链"的陷阱。Go 版保留它只为
+    //      向后兼容，官方前端默认勾选。
+    //   2. 判定式曾是 `=== true` 语义（truthy），字段为 undefined（旧配置
+    //      从未写过该项）时走不编码分支 → **沉默的、逐文件发作的坏链**：
+    //      只有片名含空格的文件打不开，其余正常，极难归因到配置。
+    //   3. 线上排查时发现该值经 isolate 缓存传播，改动后不同边缘节点
+    //      读数不一致，同一文件**时而编码时而裸 URL**（实测 8 次取样 6:2）。
+    //      靠配置控制意味着修复生效时间不可控。
+    //
+    // 结论：编码是**正确性要求**，不是可选项 —— 故无条件执行，忽略配置值。
+    // 保留 `encodePath` 字段仅为兼容旧配置的读写，不再参与判断。
+    finalPath = this.encodePath(path)
 
     // ── 对齐 Go：WithSign → sign.Sign(path) 后拼 ?sign= ──────────────────
     if (this.addition.withSign) {
