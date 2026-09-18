@@ -58,19 +58,47 @@ async function scheduled(
     const { sweepTempFilesAll } = await import("./drivers/139/cas/restore")
 
     const storages = await getStorages()
+    // ⚠️ driver 的**实际取值是注册名 `139Yun`**（见 server/admin.ts 的
+    //    normalizeDriver：它按 driverConfigs 的 key 归一化，而 139 的 key
+    //    就是 "139Yun"）。此前这里写死 `"139"`，导致过滤结果恒为空数组，
+    //    cron 每 2 小时空跑一次 —— TEMP 目录因此持续堆积。
+    //    这里同时兼容 "139" 与 "139Yun"，避免历史数据里的旧值被漏掉。
+    //    addition 需要先 JSON.parse 成对象才能读到 cas_play_enabled
+    //    （KV 里存的是 `enc:v1:…` 加密串，解密后仍是 JSON 字符串）。
+    const parseAdd = (a: any) => {
+      if (!a) return {}
+      if (typeof a !== "string") return a
+      try {
+        return JSON.parse(a)
+      } catch {
+        return {}
+      }
+    }
     const targets = (storages || []).filter(
-      (s: any) => s.driver === "139" && s.addition?.cas_play_enabled !== false,
+      (s: any) =>
+        (s.driver === "139Yun" || s.driver === "139") &&
+        parseAdd(s.addition)?.cas_play_enabled !== false,
     )
 
     let total = 0
     for (const s of targets) {
       try {
         const { Yun139ApiClient } = await import("./drivers/139/util")
-        const client = new Yun139ApiClient(s.addition)
+        // ⚠️ 必须先把 addition 解析成对象再交给驱动。
+        //
+        //    KV 里的 addition 是**加密字符串**（`enc:v1:…`），loadDb 时
+        //    unsealDb 解密后得到的是**JSON 字符串**而非对象。
+        //    正常请求路径会经 op/storage.ts 的 parseAddition() 做 JSON.parse，
+        //    但 cron 这边此前直接 `new Yun139ApiClient(s.addition)` 传了字符串，
+        //    于是 util.ts 里 `addition.authorization` 恒为 undefined
+        //    → authValue 为空 → init() 抛 "139 Cloud Authorization is required"。
+        //    结果：cron 每 2 小时跑一次，每次都失败，TEMP 目录一直堆积。
+        const addition = parseAdd(s.addition)
+        const client = new Yun139ApiClient(addition)
         await client.init?.()
 
         const rootId =
-          s.addition?.root_folder_id ||
+          addition?.root_folder_id ||
           (client.isPersonalNew() ? "/" : "")
 
         total += await sweepTempFilesAll(client, rootId)

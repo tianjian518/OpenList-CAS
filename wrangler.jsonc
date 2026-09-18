@@ -23,15 +23,16 @@
 // 用户填入的值会成为该 Worker 的 Secret，后续更新不会被覆盖。
 // =============================================================================
 {
-  "name": "openlist-tsworkers",
+  "name": "opencas-tsworkers",
   "main": "src/backend/worker.ts",
   "compatibility_date": "2026-08-04",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "preview_urls": false,
+  "routes": [{ "pattern": "tj518.de5.net", "custom_domain": true }],
 
   // 自定义域名绑定（需该域名已托管在本 CF 账号的 Zone 中）
-  "routes": [{ "pattern": "tj518.de5.net", "custom_domain": true }],
+  
 
   // ===========================================================================
   // 定时触发器（Cron Triggers）
@@ -50,13 +51,23 @@
   // 频率选择：每 2 小时一次。太低会堆积，太高则浪费子请求配额
   // （回收站本身也会自动清理，CF 侧只需定期把副本"送进回收站"）。
   "triggers": {
-    "crons": ["0 0/2 * * *"],
+    "crons": ["0 * * * *"],
   },
 
   // 存储绑定：KV（免费额度最大，最通用）。
-  // 省略 id 让 wrangler 预配；若要复用账户内已有命名空间，填 id 即可。
-  // 线上实际使用：openlist-tsworkers-kv = fe69024aa86d4fb0bdfd4d312b8d59d7
-  "kv_namespaces": [{ "binding": "KV" }],
+  //
+  // ⚠️ 这里必须写线上真实在用的那个命名空间，否则会读到一个空 KV，
+  //    导致：配置丢失 + 139 路径索引读不到（每次都要逐层请求上游）。
+  //    后果是子请求配额被吃光，表现为 WebDAV/PROPFIND 间歇性 503、
+  //    第三方播放器报「WebDAV 地址错误」，而且刷新一下又能用（换了个边缘实例重试）。
+  //
+  // 历史坑：本文件曾写死 195ce3674611446c8217530bbbb0387d（opencas-tsworkers-kv，**空**），
+  //        而真实数据一直躺在 openlist-tsworkers-kv = fe69024aa86d4fb0bdfd4d312b8d59d7 里。
+  //        原因是 Worker 曾从 openlist-tsworkers 改名为 opencas-tsworkers，
+  //        wrangler 自动预配了一个新命名空间，老数据就被落下了。
+  "kv_namespaces": [
+    { "binding": "KV", "id": "fe69024aa86d4fb0bdfd4d312b8d59d7" },
+  ],
 
   "assets": {
     "directory": "./dist",
