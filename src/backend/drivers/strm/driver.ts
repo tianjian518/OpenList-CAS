@@ -86,22 +86,49 @@ function getPair(path: string): [string, string] {
  * 的相对子路径、根目录仍走 listRoot），使 CF 单路径配置的行为与 Go 的
  * 多路径配置**完全一致** —— 这才符合用户「换任何配置都不能崩」的要求。
  */
-function getRootAndPath(
+export function getRootAndPath(
   path: string,
   autoFlatten = false,
   oneKey = "",
 ): [string, string] {
   if (autoFlatten) {
-    // 等价于非展平：从完整路径里剥掉 oneKey 这一段
-    const full = String(path || "/").replace(/^\//, "")
+    /**
+     * 单条 paths 时 pathMap 形如 `{ "移动": ["/移动"] }`：
+     *   - key  = 路径最后一段（这里是「移动」），也是展开后列表里显示的名字
+     *   - root 恒为 oneKey（唯一映射），无需从请求路径里推断
+     *   - sub  = 请求路径**里 key 之后**的相对部分
+     *
+     * ⚠️ 曾经的 BUG（线上表现为「STRM 下平白多出一层同名目录」）：
+     *
+     *   const idx = full.indexOf("/")
+     *   if (idx < 0) return [oneKey, ""]        // ← 把整段 full 丢掉了
+     *
+     * 当 `full` 不含斜杠时（如 List("/移动CAS")），上面的写法直接返回空 sub，
+     * 于是 list() 里去 Join("/移动", "") = "/移动" —— **列的是根目录**。
+     * 用户点「移动CAS」看到的还是根目录里的 `cas600t/移动影视CAS`……
+     * 不对，看到的是根目录里那几个目录，于是再点一次「移动CAS」才轮到
+     * 「移动CAS/移动CAS」这种双写路径命中正确层级，表现为"两层相同目录"。
+     *
+     * 正确语义：**只要 full 不等于 oneKey，full 整体就是 sub**。
+     * 剥掉的是与 oneKey 同名的那一段，而不是"到第一个斜杠为止"那一段。
+     */
+    const full = String(path || "/")
+      .split("/")
+      .filter(Boolean)
+      .join("/") // 规范化：去前导/重复斜杠
     if (!full) return [oneKey, ""]
-    const idx = full.indexOf("/")
-    if (idx < 0) return [oneKey, ""] // 就是 key 本身
-    // `full` 以 oneKey 开头时剥掉它；否则整段当作子路径（健壮兜底）
-    const head = full.slice(0, idx)
-    return [head === oneKey ? oneKey : oneKey, full.slice(idx + 1)]
+
+    const parts = full.split("/")
+    // full 以 oneKey 开头（用户在列表里点进来的正常路径）→ 剥掉这一段
+    if (parts[0] === oneKey) {
+      return [oneKey, parts.slice(1).join("/")]
+    }
+    // 不以 oneKey 开头：整段都是子路径。例如 paths="/移动" 时请求
+    // "/移动CAS"，oneKey="移动" 不是前缀，sub 必须保留成 "移动CAS"，
+    // 否则会退回根目录（历史 BUG）。
+    return [oneKey, full]
   }
-  const p = String(path || "/").replace(/^\//, "")
+  const p = String(path || "").split("/").filter(Boolean).join("/")
   const idx = p.indexOf("/")
   if (idx < 0) return [p, ""]
   return [p.slice(0, idx), p.slice(idx + 1)]
