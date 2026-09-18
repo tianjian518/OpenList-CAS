@@ -125,6 +125,88 @@ function davPathOf(c: any): string {
   }
 }
 
+/**
+ * WebDAV 的挂载前缀（本部署为 `/dav`）。
+ *
+ * ## 为什么 href 必须带这个前缀
+ *
+ * RFC 4918 §8.3：PROPFIND 响应里的 `<D:href>` 是**相对于服务器根的完整路径**，
+ * 必须是客户端可以直接拿去请求的形式。客户端不会、也不应该帮你把挂载点拼回去。
+ *
+ * 此前 href 直接用了虚拟路径（`/strm/`），**丢掉了 `/dav` 前缀**，于是：
+ *
+ *   客户端挂载 https://站点/dav
+ *   → PROPFIND /dav/          → href 给 `/strm`
+ *   → 客户端认为子目录在「挂载点 + /strm」= /dav/strm
+ *   → PROPFIND /dav/strm      → href 又给 `/strm/` 与 `/strm/移动`
+ *   → 里面还有一项叫 `strm` → PROPFIND /dav/strm/strm → … **无限套娃**
+ *
+ * 表现为网易爆米花里「点目录一层一层套娃下去」，且**永远到不了真实文件**。
+ * （`/移动` 同理，但它恰好是真实目录，readdir 能成功，所以症状不显眼。）
+ *
+ * 这里从原始请求 URL 动态推导前缀（而不是写死 "/dav"），使挂载点变更时
+ * 无需再改本函数 —— 例如 `davPathOf("/dav/strm/") === "/strm/"`，
+ * 而原始 pathname 去掉该虚拟路径后剩下的 `/dav` 就是前缀。
+ */
+function davPrefixOf(c: any, davPath: string): string {
+  try {
+    const pathname = new URL(c.req.url).pathname
+    // ⚠️ 根目录（davPath === "/"）时**不能**用 endsWith 反推：
+    // 空串是任何字符串的后缀，会得到「整个 pathname」这种荒谬结果。
+    // 但也不能像早期版本那样直接跳过 —— 否则根目录请求会退回写死的 "/dav"，
+    // 挂载点一变根目录 href 就错（子目录却对，故障极难定位）。
+    //
+    // 根目录的正确语义：把结尾的斜杠去掉，剩下的就是挂载前缀。
+    //   /dav/     → /dav
+    //   /webdav/  → /webdav
+    if (davPath === "/" || davPath === "") {
+      const trimmed = pathname.replace(/\/+$/, "")
+      return trimmed || ""
+    }
+    // 非根：原始 pathname 可能是百分号编码的（/dav/%E7%A7%BB%E5%8A%A8），
+    // 而 davPath 是解码后的（/移动），按长度裁切不可靠 ——
+    // 改为裁掉「原始串里对应虚拟路径的那一段」。
+    // 用编码后的形式再试一次，兼容中文路径。
+    const candidates = [davPath, encodeDavPath(davPath), davPath.endsWith("/") ? davPath.slice(0, -1) : davPath + "/", encodeDavPath(davPath.endsWith("/") ? davPath.slice(0, -1) : davPath + "/")]
+    for (const cnd of candidates) {
+      if (cnd && pathname.endsWith(cnd)) {
+        return pathname.slice(0, pathname.length - cnd.length).replace(/\/+$/, "")
+      }
+    }
+    // 回退：按固定挂载点处理
+    return "/dav"
+  } catch {
+    return "/dav"
+  }
+}
+
+/**
+ * 把虚拟路径逐段百分号编码，保留 `/` 分隔符。
+ *
+ * ## 为什么不直接用 encodeURIComponent
+ *
+ * `encodeURIComponent("/移动/")` 会把斜杠也编成 `%2F`，路径结构就没了；
+ * 而完全不编码又会出现**混合编码**：父路径 `/dav/移动/` 里的中文是裸的，
+ * 子项名却被 `encodeURIComponent` 编成了 `%E7%A7%BB%E5%8A%A8`，客户端拿到
+ * `/dav/移动/%E7%A7%BB%E5%8A%A8` 这种半编码串，部分实现会解析失败。
+ *
+ * 所以逐段编码、用 `/` 还原。
+ *
+ * ⚠️ xml.ts 里对**子项名**另有 `encodeURIComponent`，所以本函数只需处理
+ * 父路径；重复编码同一段也不会出错（`%` 本身不在需转义字符集里，
+ * 但 encodeURIComponent 会把它变成 %25 —— 故此处**不能**对已编码段二次调用）。
+ */
+function encodeDavPath(p: string): string {
+  return String(p || "/")
+    .split("/")
+    .map((seg) => {
+      // 已是合法编码段（形如 %XX 或 %XX%XX…）则原样保留，避免二次编码
+      if (/^(?:%[0-9A-Fa-f]{2})+$/.test(seg)) return seg
+      return encodeURIComponent(seg).replace(/%2F/gi, "/")
+    })
+    .join("/")
+}
+
 /** 拆分虚拟路径为 { dir, name } */
 function splitPath(p: string): { dir: string; name: string } {
   const clean = p.startsWith("/") ? p : "/" + p
@@ -170,7 +252,11 @@ webdavRouter.all("/*", async (c) => {
           isFolder: !!it.is_dir,
           modified: it.modified || new Date().toISOString(),
         }))
-        const href = davPath === "/" ? "/" : davPath.endsWith("/") ? davPath : davPath + "/"
+        // ⚠️ href 必须带挂载前缀（`/dav`），否则客户端会把子目录当成
+        // 「挂载点 + href」去请求，导致无限套娃（详见 davPrefixOf 注释）。
+        const prefix = davPrefixOf(c, davPath)
+        const virtual = davPath === "/" ? "/" : davPath.endsWith("/") ? davPath : davPath + "/"
+        const href = `${prefix}${encodeDavPath(virtual)}`
         const xml = buildWebDavPropfindResponse(href, items)
         return c.body(xml, depth === "0" ? 207 : 207, {
           "Content-Type": "application/xml; charset=utf-8",
