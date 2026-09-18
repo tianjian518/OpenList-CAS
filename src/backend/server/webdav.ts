@@ -23,18 +23,63 @@ import { safeErrorMessage } from "../pkg/errs"
 
 export const webdavRouter = new Hono()
 
-const getStorageRequestContext = (c: any) => {
+/**
+ * 当次请求的站点 origin（如 `https://tj518.de5.net`）。
+ *
+ * 用途：strm 驱动生成 `.strm` 文件内容时必须写出**绝对 URL**
+ * （对齐 Go `common.GetApiUrl(ctx)`）。WebDAV 是网易爆米花 / Kodi / Infuse
+ * 等第三方播放器的主要接入方式，它们把 `.strm` 内容当作**独立 URL** 去请求，
+ * 没有站点上下文可推断相对路径 —— 缺了 origin 就只会写出 `/d/xxx.cas`
+ * 这类相对路径，播放器直接报「webdav 地址错误」。
+ */
+const getRequestOrigin = (c: any): string | undefined => {
   try {
-    const executionCtx = c.executionCtx
-    if (!executionCtx || typeof executionCtx.waitUntil !== "function") {
-      return undefined
-    }
-    return { 
-      waitUntil: (p: Promise<unknown>) => executionCtx.waitUntil(p),
-      env: c.env, // 传递 env 用于请求级 KV 缓存复用
-    }
+    return new URL(c.req.url).origin
   } catch {
     return undefined
+  }
+}
+
+/**
+ * 把可能是相对路径的地址补全为绝对 URL。
+ *
+ * WebDAV 客户端在跟随 302 时，对「相对 Location」的处理并不统一：RFC 7231
+ * 规定按当前请求 URI 解析，于是 `/dav/电影/xxx.strm` 收到 `Location: /api/p/...`
+ * 会被规范解析为站点根下的 `/api/p/...`（正确）；但网易爆米花等客户端会按
+ * 「相对目录」拼接，得到 `/dav/api/p/...`（错误）。直接给绝对 URL 可同时
+ * 满足两类实现，消除歧义。
+ *
+ * 已是绝对地址（http/https，多为 CDN 直链）时原样透传。
+ */
+const toAbsoluteUrl = (target: string, c: any): string => {
+  const t = String(target || "")
+  if (/^https?:\/\//i.test(t)) return t
+  const origin = getRequestOrigin(c)
+  if (!origin) return t
+  return `${origin}${t.startsWith("/") ? "" : "/"}${t}`
+}
+
+const getStorageRequestContext = (c: any) => {
+  // ⚠️ 此处**不能**因为缺少 executionCtx 就整体返回 undefined：
+  // EdgeOne / Node 云函数运行时可能没有 `c.executionCtx`，那样会连 `env`
+  // 与 `requestOrigin` 一起丢掉，导致 strm 驱动拿不到站点地址、退回相对路径。
+  // 因此 waitUntil 与其余字段分开构造，各自降级。
+  let waitUntil: ((p: Promise<unknown>) => void) | undefined
+  try {
+    const executionCtx = c.executionCtx
+    if (executionCtx && typeof executionCtx.waitUntil === "function") {
+      waitUntil = (p: Promise<unknown>) => executionCtx.waitUntil(p)
+    }
+  } catch {
+    // 忽略：无 waitUntil 时由 op 层退化为直接 await 持久化
+  }
+
+  return {
+    waitUntil,
+    env: c.env, // 传递 env 用于请求级 KV 缓存复用
+    // 请求级站点 origin：op 层会把它透传给 getDriver，
+    // strm 驱动据此生成绝对 URL（对齐 Go common.GetApiUrl(ctx)）
+    requestOrigin: getRequestOrigin(c),
   }
 }
 
@@ -140,7 +185,13 @@ webdavRouter.all("/*", async (c) => {
         if (item.is_dir) return c.text("Is a directory", 400)
         // 重定向到 rawRouter（/api/p/*）实际下载；rawRouter 已处理所有驱动的
         // 下载协议（proxy/redirect/stream + Range + SSRF 防护）
-        return c.redirect(rawUrl || `/api/p${davPath.startsWith("/") ? "" : "/"}${davPath}`, 302)
+        const target =
+          rawUrl || `/api/p${davPath.startsWith("/") ? "" : "/"}${davPath}`
+        // ⚠️ 必须补成**绝对 URL**：rawUrl 由 op 层产出的是站点根路径
+        // （`/api/p/...`），而 WebDAV 挂在 `/dav` 下。部分客户端（含网易爆米花）
+        // 会按「相对当前目录」解析 302 的 Location，从而拼出
+        // `/dav/api/p/...` → 404，表现为「webdav 地址错误」。
+        return c.redirect(toAbsoluteUrl(target, c), 302)
       }
 
       case "PUT": {

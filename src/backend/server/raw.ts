@@ -303,13 +303,21 @@ rawRouter.get("/*", async (c) => {
             const nd = normDriver
             const is139 =
               nd === "139" || nd === "yun139" || nd === "139yun"
-            const playerLike =
-              !!c.req.header("Range") ||
-              /video\/|audio\//i.test(c.req.header("Accept") || "") ||
-              ["video", "audio"].includes(
-                (c.req.header("Sec-Fetch-Dest") || "").toLowerCase(),
-              )
-            if (is139 && playerLike && /\.cas$/i.test(reqPath)) {
+            // ⚠️ 判定依据是**文件本身是不是 `.cas` 占位文件**，而不是请求头。
+            //
+            // 此前用 `playerLike`（Range / Accept: video|audio /
+            // Sec-Fetch-Dest ∈ {video,audio}）当门槛，导致**原生 App 全部失效**：
+            // 网易爆米花经 WebDAV 播放时，读 `.strm` 是完整 GET（无 Range），
+            // Accept 为 `*/*`（非 `video/*`），且根本不发 Sec-Fetch-Dest
+            // （那是浏览器专属头）。三个条件全不成立 → 不 302 →
+            // 退回代理那个 540 字节的 `.cas` 占位文件 → 播放器拿到垃圾数据，
+            // 表现为「webdav 地址错误」。而浏览器恰好全满足，所以网页端正常，
+            // 故障只在第三方播放器上暴露。
+            //
+            // `.cas` 后缀已经唯一标识「秒传占位文件，必须还原后给直链」，
+            // 无需再用请求头猜测调用方是不是播放器：任何客户端来取 `.cas`，
+            // 唯一有意义的响应都是还原后的真实视频直链。
+            if (is139 && /\.cas$/i.test(reqPath)) {
               // 优先复用 `driver.get()` 已经还原好的直链。
               //
               // 139 驱动的 `get()` 内部就会对 `.cas` 调用 resolveCasPlayLink
