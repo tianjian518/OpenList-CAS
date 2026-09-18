@@ -9,6 +9,15 @@ import { sortFileItems } from "../../internal/driver/sort"
 import { Cloud189Addition, FileItem189, FolderItem189 } from "./types"
 import { Pan189Client } from "./util"
 import { md5Hex } from "./crypto"
+import {
+  flushPathIndex,
+  lookupFirstHit,
+  lookupPathId,
+  normalizeIndexPath,
+  rememberChildren,
+  rememberPathId,
+  type PathIndexOptions,
+} from "../139/pathindex"
 
 const SUBREQUEST_LIMIT = 45
 const UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024
@@ -102,6 +111,10 @@ export class Cloud189Driver implements StorageDriver {
   private pathIdCache = new Map<string, string>()
   /** CF Workers subrequest budget */
   private budget = { used: 0, limit: SUBREQUEST_LIMIT }
+  /** 存储 id（用于隔离索引），由 storage.ts 在构造后注入 */
+  private storageId?: string | number
+  /** 运行环境上下文，索引落盘时用 */
+  private envCtx?: any
 
   constructor(
     addition: Cloud189Addition,
@@ -111,8 +124,44 @@ export class Cloud189Driver implements StorageDriver {
     this.client = new Pan189Client(this.addition, onCookieUpdate)
   }
 
+  /**
+   * 注入运行时上下文（存储 id / env）。
+   *
+   * 天翼云盘只认 folderId、不认路径，解析深层目录要**从根逐级**
+   * `getFiles` —— 路径有 N 段就是 N 次串行请求。而 CF Workers 的 isolate
+   * 会在边缘节点间漂移（实测同一客户端连续请求落到 AMS / LHR 等不同机房），
+   * 进程内 `pathIdCache` 命中率极低，于是深层目录 PROPFIND 稳定耗时
+   * 3~10 秒，超出播放器（网易爆米花等）的超时阈值 → 报错，重试时
+   * 恰好命中的 isolate 或上游较快 → 又能打开。
+   *
+   * 因此复用 139 那套**持久化路径索引**（KV），使解析成本不再随深度增长。
+   */
+  setRuntimeContext(ctx: { storageId?: string | number; env?: any }): void {
+    if (ctx.storageId !== undefined) this.storageId = ctx.storageId
+    if (ctx.env !== undefined) this.envCtx = ctx.env
+  }
+
+  /**
+   * 索引操作所需的公共参数。
+   * `namespace: "189"` 与 139 的索引键隔离 —— 两者默认账号的
+   * storageId/短哈希都可能撞车，不隔离会读到另一个盘的目录 ID。
+   */
+  private indexOpts(): PathIndexOptions {
+    return {
+      addition: this.addition,
+      storageId: this.storageId,
+      env: this.envCtx,
+      namespace: "189",
+    }
+  }
+
   async init(): Promise<void> {
     await this.client.login()
+  }
+
+  /** 请求结束前把索引落盘（由 storage.ts 在 flushPendingDriverState 时调用） */
+  async flushState(): Promise<void> {
+    await flushPathIndex(this.envCtx)
   }
 
   /**
@@ -126,26 +175,43 @@ export class Cloud189Driver implements StorageDriver {
 
   /**
    * 将 physicalPath 解析为对应的 folderId。
-   * 逐级向下解析并缓存路径 ID 映射。
+   *
+   * ## 核心优化（与 139 同构）
+   *
+   * 天翼云盘只认 folderId、不认路径，朴素实现只能从根逐层向下问，
+   * 成本随深度线性增长（点开第 N 层 = N 次串行请求）。
+   *
+   * 这里引入**持久化路径索引**（见 ../139/pathindex.ts，命名空间 `189`）：
+   *   1. 先查索引，命中则直接返回，**0 次请求**；
+   *   2. 未命中才逐层解析，每解析一层就**登记**该层；
+   *   3. `list()` 会用 `rememberChildren` 预填下一层 ID（零额外成本）。
+   *
+   * 为什么必须持久化而不能只靠进程内 Map：CF Workers 的 isolate 会在
+   * 不同边缘节点间漂移 —— 实测**同一客户端连续 6 次请求分别落到
+   * AMS 与 LHR 两台机器**，进程内缓存几乎不命中，于是每次都从根重建，
+   * 叠加出口在欧洲、目标在国内的跨洲往返（单次 300~800ms），
+   * 深层目录 PROPFIND 稳定 3~10 秒，超出播放器超时阈值。
    */
   private async resolveFolderId(physicalPath: string): Promise<string> {
     const rootId = this.client.getRootId()
-    const clean =
-      "/" +
-      String(physicalPath || "")
-        .split("/")
-        .filter(Boolean)
-        .join("/")
+    const clean = normalizeIndexPath(physicalPath)
 
     if (clean === "/" || clean === `/${rootId}`) {
       return rootId
     }
+
+    const opts = this.indexOpts()
+
+    // ① 精确命中：0 次上游请求
+    const hit = await lookupPathId(clean, opts)
+    if (hit) return hit
 
     const segs = clean.split("/").filter(Boolean)
     let cachedLen = 0
     let parentId = rootId
     let prefix = ""
 
+    // ② 进程内前缀缓存（同 isolate 内最快）
     for (let i = 0; i < segs.length; i++) {
       const p = "/" + segs.slice(0, i + 1).join("/")
       const id = this.pathIdCache.get(p)
@@ -155,6 +221,23 @@ export class Cloud189Driver implements StorageDriver {
         prefix = p
       } else {
         break
+      }
+    }
+
+    // ③ 仍无起点：从索引里找**最深的已知前缀**一次性查出来，
+    //    避免在循环里逐个 await（每个前缀都会消耗 KV 读取预算）。
+    if (cachedLen === 0) {
+      const candidates: string[] = []
+      for (let i = segs.length - 1; i >= 1; i--) {
+        candidates.push("/" + segs.slice(0, i).join("/"))
+      }
+      if (candidates.length) {
+        const best = await lookupFirstHit(candidates, opts)
+        if (best) {
+          parentId = best.id
+          prefix = best.path
+          cachedLen = best.path.split("/").filter(Boolean).length
+        }
       }
     }
 
@@ -188,6 +271,8 @@ export class Cloud189Driver implements StorageDriver {
       parentId = String(folder.id)
       prefix = "/" + segs.slice(0, i + 1).join("/")
       this.pathIdCache.set(prefix, parentId)
+      // 逐层登记进持久化索引：下次（哪怕落到别的 isolate）可直接命中
+      rememberPathId(prefix, parentId, opts)
     }
 
     return parentId
@@ -253,6 +338,21 @@ export class Cloud189Driver implements StorageDriver {
     const { files, folders } = await this.client.getFiles(folderId, {
       budget: this.budget,
     })
+
+    // 顺带把本层子目录的「路径 → ID」登记进索引：子目录名与 ID 由本次
+    // list 响应白送，属于**零额外成本**的收益。用户往里点一层时即可直接
+    // 命中，省掉整段逐层解析 —— 越往下点越快。
+    try {
+      const selfPath = normalizeIndexPath(physicalPath)
+      rememberPathId(selfPath, folderId, this.indexOpts())
+      rememberChildren(
+        selfPath,
+        folders.map((f) => ({ name: f.name, id: String(f.id) })),
+        this.indexOpts(),
+      )
+    } catch {
+      // 忽略：索引登记失败只影响加速效果，不影响本次列表
+    }
 
     const items: FileItem[] = [
       ...folders.map(pan189FolderToFileItem),

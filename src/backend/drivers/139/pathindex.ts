@@ -25,8 +25,25 @@
  * 跑几次之后就永远读不到 KV 了。
  */
 
-/** KV 中的键前缀，避免与其他模块的键冲突 */
-const KV_PREFIX = "opencas_139_idx_"
+/**
+ * KV 中的键前缀（默认值），避免与其他模块的键冲突。
+ *
+ * ⚠️ 本模块已泛化为**多驱动共用**的路径索引：天翼云盘（189）与 139 同属
+ * 「接口只认目录 ID、不支持按路径定位」的类型，都受同一个性能问题困扰 ——
+ * 每次列深层目录都要从根逐级 `getFiles` 解析，而 isolate 在边缘节点间
+ * 漂移导致进程内缓存命中率极低，表现为深层目录 PROPFIND 稳定 3~10 秒。
+ *
+ * 因此 KV 前缀改为按驱动命名空间区分（`PathIndexOptions.namespace`），
+ * 使两个驱动的索引互不干扰，同时共享这一套经过线上验证的读写/节流逻辑。
+ * 默认值保持 `139`，确保 139 驱动既有行为的 KV 键**完全不变**。
+ */
+/** 各命名空间对应的 KV 键前缀 */
+function kvPrefixOf(namespace?: string): string {
+  const ns = String(namespace || "139")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+  return `opencas_${ns || "139"}_idx_`
+}
 
 /**
  * 索引读 KV 的超时（毫秒）。
@@ -70,8 +87,7 @@ const MAX_ENTRIES = 5000
 /** 进程内索引：storageKey → (规范化路径 → {id, ts}) */
 const memoryIndex = new Map<string, Record<string, PathIndexEntry>>()
 
-/** 待回写 KV 的 storageKey 集合 */
-const dirtyKeys = new Set<string>()
+// 注意：`dirtyKeys` 定义在下方（`Map<内存键, KV键>`），因为回写需要 KV 键。
 
 /** 防抖计时器句柄 */
 let flushTimer: any = null
@@ -123,6 +139,11 @@ export interface PathIndexOptions {
   storageId?: any
   /** 环境绑定（CF Workers 的 env），用于取 KV */
   env?: any
+  /**
+   * KV 键的驱动命名空间。默认 `139`（保持既有键不变）；
+   * 天翼云盘（189）传 `189`，两类索引完全隔离。
+   */
+  namespace?: string
 }
 
 /**
@@ -153,12 +174,34 @@ function hashShort(s: string): string {
  * 计算索引所属的 key。
  * 优先用 storageId（同一账号可配多个存储，必须隔离）；
  * 没有 storageId 时退化到 authorization 的短哈希。
+ *
+ * 返回值可用于**进程内** Map 与 KV 键的后半段（KV 键还需拼命名空间前缀）。
  */
 function storageKeyOf(addition: any, storageId?: any): string {
   if (storageId !== undefined && storageId !== null && String(storageId) !== "") {
     return String(storageId)
   }
   return `acc_${addition?.authorization ? hashShort(addition.authorization) : "default"}`
+}
+
+/**
+ * 组合出「内存 Map 键」与「KV 键」。
+ *
+ * ⚠️ 内存 Map 键**必须带命名空间**：139 与 189 的 storageId 或
+ * authorization 短哈希理论上可能撞车（尤其用默认账号时都是 `acc_default`），
+ * 不加命名空间会让两个驱动的索引互相污染 —— 表现为「列出来的是另一个盘的
+ * 目录」，且因为 ID 恰好存在而**不报错**，极难排查。
+ */
+function memKeyOf(opts: PathIndexOptions): string {
+  const ns = String(opts.namespace || "139")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+  return `${ns || "139"}:${storageKeyOf(opts.addition, opts.storageId)}`
+}
+
+/** KV 键 = 命名空间前缀 + storageKey */
+function kvKeyOf(opts: PathIndexOptions): string {
+  return `${kvPrefixOf(opts.namespace)}${storageKeyOf(opts.addition, opts.storageId)}`
 }
 
 /** 读进程内索引（可能为空） */
@@ -202,12 +245,12 @@ async function getBinding(env?: any): Promise<any> {
  * 读失败一律返回 null（索引是加速手段，不该让主流程失败）。
  */
 async function kvLoad(
-  storageKey: string,
+  kvKey: string,
   env?: any,
 ): Promise<Record<string, PathIndexEntry> | null> {
-  if (kvAttemptedKeys.has(storageKey)) return null
+  if (kvAttemptedKeys.has(kvKey)) return null
   if (kvLoadsThisRequest >= MAX_KV_LOADS_PER_REQUEST) return null
-  kvAttemptedKeys.add(storageKey)
+  kvAttemptedKeys.add(kvKey)
   kvLoadsThisRequest++
 
   const binding = await getBinding(env)
@@ -216,10 +259,7 @@ async function kvLoad(
     // 【超时兜底】索引是 45KB 的大 key，CF KV 边缘缓存未命中时要回源中心存储，
     // 没有超时会无限挂起、拖死整个 PROPFIND（实测线上 57% 请求卡死十几秒）。
     // 索引只是加速手段，读不到就退化成「无索引」路径，绝不能让它拖垮请求。
-    const raw = await withTimeout(
-      binding.get(`${KV_PREFIX}${storageKey}`),
-      KV_INDEX_TIMEOUT_MS,
-    )
+    const raw = await withTimeout(binding.get(kvKey), KV_INDEX_TIMEOUT_MS)
     if (!raw) return null
     const parsed = JSON.parse(typeof raw === "string" ? raw : String(raw))
     if (!parsed || typeof parsed !== "object") return null
@@ -241,7 +281,7 @@ async function kvLoad(
  * 索引回写纯属优化（丢了最多下次重新解析一遍），因此超时后直接放弃。
  */
 async function kvSave(
-  storageKey: string,
+  kvKey: string,
   map: Record<string, PathIndexEntry>,
   env?: any,
 ): Promise<void> {
@@ -249,7 +289,7 @@ async function kvSave(
   if (!binding) return
   try {
     await withTimeout(
-      Promise.resolve(binding.put(`${KV_PREFIX}${storageKey}`, JSON.stringify(map))),
+      Promise.resolve(binding.put(kvKey, JSON.stringify(map))),
       KV_INDEX_TIMEOUT_MS,
     )
   } catch {
@@ -257,9 +297,17 @@ async function kvSave(
   }
 }
 
+/**
+ * 脏表：内存键 → KV 键。
+ *
+ * 用 Map 而不是 Set，是因为回写时需要**同时**知道读哪个内存表、写哪个 KV 键；
+ * 二者都依赖命名空间，只在标记时算一次最省事。
+ */
+const dirtyKeys = new Map<string, string>()
+
 /** 标脏并安排一次防抖回写 */
-function markDirty(storageKey: string): void {
-  dirtyKeys.add(storageKey)
+function markDirty(memKey: string, kvKey: string): void {
+  dirtyKeys.set(memKey, kvKey)
   scheduleBackgroundFlush()
 }
 
@@ -289,10 +337,10 @@ function scheduleBackgroundFlush(): void {
  */
 export async function flushPathIndex(env?: any): Promise<void> {
   if (dirtyKeys.size === 0) return
-  const keys = Array.from(dirtyKeys)
+  const entries = Array.from(dirtyKeys)
   dirtyKeys.clear()
-  for (const key of keys) {
-    const map = memGet(key)
+  for (const [memKey, kvKey] of entries) {
+    const map = memGet(memKey)
     if (!map) continue
     const paths = Object.keys(map)
     if (paths.length > MAX_ENTRIES) {
@@ -300,7 +348,7 @@ export async function flushPathIndex(env?: any): Promise<void> {
       const drop = paths.length - MAX_ENTRIES
       for (let i = 0; i < drop; i++) delete map[paths[i]]
     }
-    await kvSave(key, map, env)
+    await kvSave(kvKey, map, env)
   }
 }
 
@@ -343,15 +391,15 @@ export async function lookupPathId(
   path: string,
   opts: PathIndexOptions,
 ): Promise<string | null> {
-  const key = storageKeyOf(opts.addition, opts.storageId)
+  const memKey = memKeyOf(opts)
   const p = normalizeIndexPath(path)
 
-  const mem = memGet(key)
+  const mem = memGet(memKey)
   if (mem && mem[p]) return mem[p].id
 
-  const fromKv = await kvLoad(key, opts.env)
+  const fromKv = await kvLoad(kvKeyOf(opts), opts.env)
   if (fromKv) {
-    const merged = memGet(key)
+    const merged = memGet(memKey)
     if (merged) {
       // 内存里已有部分数据：只补缺失的键，不覆盖（内存版本可能更新）
       for (const k of Object.keys(fromKv)) {
@@ -359,7 +407,7 @@ export async function lookupPathId(
       }
       if (merged[p]) return merged[p].id
     } else {
-      memoryIndex.set(key, fromKv)
+      memoryIndex.set(memKey, fromKv)
       if (fromKv[p]) return fromKv[p].id
     }
   }
@@ -379,8 +427,7 @@ export async function lookupFirstHit(
   opts: PathIndexOptions,
 ): Promise<{ path: string; id: string } | null> {
   if (!paths.length) return null
-  const key = storageKeyOf(opts.addition, opts.storageId)
-  const map = await loadIndexOnce(key, opts.env)
+  const map = await loadIndexOnce(memKeyOf(opts), kvKeyOf(opts), opts.env)
   if (!map) return null
   for (const raw of paths) {
     const p = normalizeIndexPath(raw)
@@ -412,15 +459,16 @@ export async function lookupFirstHit(
  * 仍要去 KV 尝试合并一次；KV 结果按「内存优先」合并，不覆盖较新的记录。
  */
 async function loadIndexOnce(
-  storageKey: string,
+  memKey: string,
+  kvKey: string,
   env?: any,
 ): Promise<Record<string, PathIndexEntry>> {
-  const mem = memGet(storageKey)
+  const mem = memGet(memKey)
 
   // 内存表已足够"厚"（说明本 isolate 确实加载过完整索引），直接用
   if (mem && Object.keys(mem).length >= MIN_LOADED_INDEX_ENTRIES) return mem
 
-  const fromKv = await kvLoad(storageKey, env)
+  const fromKv = await kvLoad(kvKey, env)
   if (fromKv) {
     if (mem) {
       // 内存优先：只补 KV 里有、内存里没有的键
@@ -429,10 +477,10 @@ async function loadIndexOnce(
       }
       return mem
     }
-    memoryIndex.set(storageKey, fromKv)
+    memoryIndex.set(memKey, fromKv)
     return fromKv
   }
-  return mem || memEnsure(storageKey)
+  return mem || memEnsure(memKey)
 }
 
 /**
@@ -454,13 +502,13 @@ export function rememberPathId(
   opts: PathIndexOptions,
 ): void {
   if (!id) return
-  const key = storageKeyOf(opts.addition, opts.storageId)
+  const memKey = memKeyOf(opts)
   const p = normalizeIndexPath(path)
-  const map = memEnsure(key)
+  const map = memEnsure(memKey)
   const exist = map[p]
   if (exist && exist.id === id) return // 无变化，不标脏
   map[p] = { id, ts: Date.now() }
-  markDirty(key)
+  markDirty(memKey, kvKeyOf(opts))
 }
 
 /**
@@ -475,8 +523,8 @@ export function rememberChildren(
   opts: PathIndexOptions,
 ): void {
   if (!children.length) return
-  const key = storageKeyOf(opts.addition, opts.storageId)
-  const map = memEnsure(key)
+  const memKey = memKeyOf(opts)
+  const map = memEnsure(memKey)
   let changed = false
   for (const c of children) {
     if (!c.id || !c.name) continue
@@ -486,5 +534,5 @@ export function rememberChildren(
     map[p] = { id: c.id, ts: Date.now() }
     changed = true
   }
-  if (changed) markDirty(key)
+  if (changed) markDirty(memKey, kvKeyOf(opts))
 }

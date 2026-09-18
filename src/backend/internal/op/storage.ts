@@ -1436,7 +1436,14 @@ export async function flushPendingDriverState(
   // 索引是"解析成本不随目录深度增长"的关键（139 接口只支持按父目录 ID
   // 逐层查询），需要跨请求持久化。这里每请求最多产生 1 次 KV 写，
   // 避免撞上平台的子请求配额。
-  if (isYun139Driver(driverName)) {
+  // 139 与 189 共用同一套路径索引（KV 键按驱动命名空间隔离）。
+  //
+  // 天翼云盘（189）的接口与 139 同属「只认目录 ID、不支持按路径定位」，
+  // 解析一层深层目录要从根逐级 `getFiles`，而 CF Workers 的 isolate
+  // 在 AMS/LHR 等边缘节点间漂移，进程内 pathIdCache 命中率极低 ——
+  // 实测深层目录 PROPFIND 稳定 3~10 秒并因此触发播放器超时。
+  // 接入同样的持久化索引后，解析成本不再随目录深度增长。
+  if (isYun139Driver(driverName) || isCloud189Driver(driverName)) {
     const flushState = (
       driver as StorageDriver & { flushState?: () => Promise<void> }
     ).flushState
