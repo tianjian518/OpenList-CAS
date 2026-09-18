@@ -29,7 +29,68 @@
 
 ---
 
-## 一键部署
+## 部署到自己的 Cloudflare（推荐）
+
+> 本仓库是个人维护的 fork，**默认的 `wrangler.jsonc` 是作者的生产配置**，
+> 内含作者的私有域名与 KV id，直接拿去部署会报错。
+> 自部署请用仓库里的 **`wrangler.template.jsonc`** 通用模板。
+
+### 方式一：一键部署（最简单）
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/tianjian518/cf-openlist)
+
+点按钮 → 授权 GitHub → 填入 `JWT_SECRET`（用 `openssl rand -hex 32` 生成）→ 部署。
+部署完直接访问 `https://<你的worker名>.<账号>.workers.dev`。
+
+> 若提示「无法获取存储库内容」，先 **Fork** 本仓库，再用「连接到 GitHub 仓库」功能部署。
+
+### 方式二：命令行部署（可控性更好）
+
+```bash
+git clone https://github.com/tianjian518/cf-openlist.git
+cd cf-openlist
+
+# 关键一步：用通用模板覆盖作者的生产配置
+cp wrangler.template.jsonc wrangler.jsonc
+
+pnpm install --no-frozen-lockfile
+pnpm run build          # 拉取前端 + 构建
+pnpm run deploy:worker
+```
+
+模板里需要改的**只有两处**，其余全部开箱可用：
+
+| 改什么 | 怎么改 |
+|---|---|
+| `"name"` | 换成你的 Worker 名（如 `my-openlist`） |
+| `"kv_namespaces"` | **删掉整项**，让 wrangler 自动创建 KV |
+
+想绑定自己的域名？打开模板里 `"routes"` 那段的注释，替换成你的域名即可
+（域名需已托管在你自己的 Cloudflare 账号下）。不用自定义域名就保持注释，
+部署完走 `*.workers.dev`。
+
+### 部署后必做
+
+```bash
+# 生产环境务必用 Secret 存密钥，不要写进 wrangler.jsonc 的 vars
+npx wrangler secret put JWT_SECRET      # 输入 openssl rand -hex 32 生成的值
+```
+
+`JWT_SECRET` 同时用于 **JWT 签名** 与 **网盘凭据加密**，一旦部署后不可更改
+（改了整个已存的凭据都解不开）。
+
+### 常见坑（都是踩过的）
+
+| 症状 | 原因 | 解决 |
+|---|---|---|
+| `/api/*` 全部卡死、`wrangler tail` 无日志 | Worker Route 残留抢占 Custom Domain（改名/换域名后常见） | 删掉旧 route：`GET /zones/{zone}/workers/routes` 拿 id 再 `DELETE` |
+| 配置全丢 + WebDAV 间歇 503 | `kv_namespaces` 指向了空 KV | 确认 id 与线上数据一致 |
+| 部署后没有入口 | `workers_dev: false` 且没配 routes | 改为 `true`，或配上自定义域名 |
+| TEMP 目录持续堆积 | 忘了配 cron `triggers` | 模板已内置 `0 * * * *`，勿删 |
+
+---
+
+## 一键部署（上游官方）
 
 点击下方按钮，即可将本项目一键部署到对应平台：
 <div align="center">
