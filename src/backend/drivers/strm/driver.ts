@@ -6,6 +6,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
+import { getEnvCtx } from "../../internal/model/db"
 import { signWithSecret } from "../../pkg/sign"
 import { goEncodePath } from "../../pkg/urlpath"
 import { StrmAddition } from "./types"
@@ -346,20 +347,54 @@ export class StrmDriver implements StorageDriver {
     // 必须输出绝对 URL，否则 strm 形同废纸。
     const configured = (this.addition.siteUrl || "").replace(/\/+$/, "")
     const apiUrl = configured || this.resolvedSiteUrl()
+    if (!apiUrl) {
+      // 兜底：真正的空 origin 会让 `.strm` 内容退化成相对路径（`/d/...`），
+      // 播放器无从推断站点 → 必然「WebDAV 地址错误」。此时宁可打日志暴露，
+      // 也不要静默产出坏链。
+      console.warn(
+        `[Strm] getLink: 站点基准地址为空，将产出相对路径 '${finalPath}'`,
+      )
+      return finalPath
+    }
     return `${apiUrl}${finalPath}`
   }
 
   /**
    * 站点基准地址（绝对 URL 前缀）。
-   * 优先用驱动配置的 siteUrl；为空时回退到本次请求的 origin
-   * （由 op/storage 在实例化时经 setSignContext 注入）。
+   *
+   * ⚠️ **这是实例级可变字段，而驱动实例被 `driverCache` 按 `id_modified`
+   * 跨请求复用** —— 多个并发请求会共享同一个值。因此：
+   *
+   *   1. 每次写入都带 `siteBaseUrlAt` 时间戳，`resolvedSiteUrl()` 只认
+   *      「新鲜」的值，避免某次请求拿到很久以前另一个请求写下的陈旧 origin；
+   *   2. 传入空值时必须**清空**而不是忽略，否则某次解析失败会把这个错值
+   *      「粘」在实例上直到 isolate 回收（这正是「时好时坏、坏一阵子又自己
+   *      好了」的来源）；
+   *   3. 最终仍取不到时回退到本次请求的 origin（`env.__requestOrigin`）。
    */
   private siteBaseUrl = ""
+  private siteBaseUrlAt = 0
+  /** 站点基准地址的有效期：远超任何单次请求的生命周期，
+   *  仅用于淘汰「上一个 isolate 生命周期遗留」的陈旧值。 */
+  private static readonly SITE_URL_TTL_MS = 10 * 60 * 1000
+
   setSiteBaseUrl(url: string): void {
     this.siteBaseUrl = String(url || "").replace(/\/+$/, "")
+    this.siteBaseUrlAt = Date.now()
   }
+
   private resolvedSiteUrl(): string {
-    return this.siteBaseUrl
+    const fresh =
+      this.siteBaseUrl && Date.now() - this.siteBaseUrlAt < StrmDriver.SITE_URL_TTL_MS
+    if (fresh) return this.siteBaseUrl
+    // 回退：本次请求中间件写入的 origin（index.ts 每请求无条件刷新）。
+    try {
+      const envOrigin = getEnvCtx?.()?.__requestOrigin
+      if (envOrigin) return String(envOrigin).replace(/\/+$/, "")
+    } catch {
+      // 忽略：拿不到就交给调用方兜底
+    }
+    return ""
   }
 
   /**
@@ -446,7 +481,17 @@ export class StrmDriver implements StorageDriver {
     const remotePath = joinPath(remote.physical, sub)
     try {
       return await remote.driver.list("", remotePath)
-    } catch {
+    } catch (e: any) {
+      // ⚠️ 不能静默吞异常。返回空数组会让上层认为「目录里没这个文件」，
+      // 于是 `strmContent()` 返回 null，请求落到 `/p` 302 代理分支 ——
+      // 播放器看到的是一个 302 而非 `.strm` 文本内容，现象就是
+      // 「WebDAV 地址错误」。而底层网盘偶发超时/限流正属此类，
+      // 这解释了**同一集时而能播、时而报错**。
+      // 这里打日志保留可观测性，返回值仍与 Go 一致（空列表）。
+      console.warn(
+        `[Strm] listRemote failed for dst='${dst}' path='${remotePath}':`,
+        e?.message || e,
+      )
       return []
     }
   }

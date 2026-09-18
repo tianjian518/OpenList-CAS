@@ -411,11 +411,33 @@ rawRouter.get("/*", async (c) => {
                 )
                 return c.body(content, 200)
               }
+              // ⚠️ 取不到内容**绝不能**继续往下走代理/302 分支。
+              //
+              // `.strm` 是虚拟文本文件，它唯一合法的响应就是「200 + 一行
+              // 播放 URL 的纯文本」。若这里放行，下面的 `linkUrl()` 会返回
+              // 一个 `/p...` 302 —— 播放器把 302 当重定向跟随，或把响应体
+              // 当成播放地址，最终都报「WebDAV 地址错误」。
+              //
+              // 取不到的真实原因通常是**底层网盘偶发超时/限流**（见
+              // `StrmDriver.listRemote` 的告警日志）。此时正确的语义是
+              // 「暂时不可用，请重试」，即 503 —— 让播放器重试，而不是
+              // 回一个语义完全错误的 302 把它引到死路。
+              console.warn(
+                `[rawRouter] strm content EMPTY for '${reqPath}', reply 503 (upstream listing likely failed)`,
+              )
+              c.header("Retry-After", "3")
+              c.header(
+                "Cache-Control",
+                "max-age=0, no-cache, no-store, must-revalidate",
+              )
+              return c.text("strm content temporarily unavailable", 503)
             } catch (e: any) {
               console.warn(
                 `[rawRouter] strm content failed for '${reqPath}':`,
                 e?.message,
               )
+              c.header("Retry-After", "3")
+              return c.text("strm content temporarily unavailable", 503)
             }
           }
 

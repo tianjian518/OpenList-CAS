@@ -60,9 +60,18 @@ app.use("*", async (c, next) => {
   const env = (c.env || {}) as any
   try {
     const reqUrl = new URL(c.req.url)
-    if (!env.__requestOrigin) {
-      env.__requestOrigin = reqUrl.origin
-    }
+    // ⚠️ 必须**无条件覆盖**，不能写成 `if (!env.__requestOrigin)`。
+    //
+    // `env` 在 CF Workers 里是整个 isolate 共享的同一个对象，而 origin 是
+    // **请求级**数据。若只在为空时赋值，则首个请求（预热、定时任务、
+    // Worker 内部自调用等）会把 __requestOrigin 永久钉死成它的 origin，
+    // 后续所有请求读到的都是这个陈旧值。
+    //
+    // 典型故障：strm 驱动用该 origin 给 `.strm` 内容拼**绝对 URL**，一旦被
+    // 钉成 `http://opencas-tsworkers.xxx.workers.dev`，所有 `.strm` 都会写出
+    // 播放器访问不到的地址 → 网易爆米花报「WebDAV 地址错误」；isolate 重建
+    // 后首个请求恰为播放器请求时又恢复正常 → 表现成**同一集时好时坏**。
+    env.__requestOrigin = reqUrl.origin
   } catch {
     // 忽略：无法解析时由驱动侧回退处理
   }
