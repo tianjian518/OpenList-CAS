@@ -9,7 +9,9 @@ import {
   removeItems,
   moveItems,
   copyItems,
+  getDriver,
 } from "../internal/op/storage"
+import { resolvePath } from "../internal/model/db"
 import { buildWebDavPropfindResponse } from "../internal/webdav/webdav"
 import { safeErrorMessage } from "../pkg/errs"
 
@@ -207,6 +209,54 @@ function encodeDavPath(p: string): string {
     .join("/")
 }
 
+/**
+ * 取虚拟 `.strm` 文件的文本内容；非 `.strm` 时返回 `null`（调用方回退到 302）。
+ *
+ * 对齐 Go `(d *Strm) Link` 分支 ①：虚拟 `.strm` 的「内容」就是那行播放 URL。
+ * WebDAV 播放器（网易爆米花等）读 `.strm` 时期望拿到这行文本，
+ * 拿到后自行请求它；若返回 302 到自身则必然失败（详见 GET 分支注释）。
+ */
+async function getStrmContent(
+  davPath: string,
+  ctx: any,
+): Promise<string | null> {
+  if (!/\.strm$/i.test(davPath)) return null
+  try {
+    const resolved = await resolvePath(davPath, ctx?.env)
+    if (resolved.isVirtual || !resolved.physical) {
+      console.log(`[webdav] strmContent skip: virtual/ no physical for '${davPath}'`)
+      return null
+    }
+    if (String(resolved.storage?.driver || "").toLowerCase() !== "strm") {
+      console.log(
+        `[webdav] strmContent skip: driver='${resolved.storage?.driver}' for '${davPath}'`,
+      )
+      return null
+    }
+    const driver: any = await getDriver(
+      resolved.storage.driver,
+      resolved.storage,
+      ctx?.requestOrigin,
+    )
+    if (typeof driver?.strmContent !== "function") {
+      console.log(`[webdav] strmContent skip: no strmContent method`)
+      return null
+    }
+    // ⚠️ 必须传 `resolved.physical`（存储内相对路径，如 `/移动/...`），
+    // **不是** davPath（带挂载点的全路径 `/strm/移动/...`）。
+    // 与 op 层调用驱动的方式一致：`driver.list(virtualPath, resolved.physical)`，
+    // 驱动只认第二个参数。
+    const out = await driver.strmContent(resolved.physical)
+    console.log(
+      `[webdav] strm content '${resolved.physical}' -> ${out ? out.slice(0, 90) : "null"}`,
+    )
+    return out
+  } catch (e: any) {
+    console.error(`[webdav] strmContent error for '${davPath}':`, e?.message)
+    return null
+  }
+}
+
 /** 拆分虚拟路径为 { dir, name } */
 function splitPath(p: string): { dir: string; name: string } {
   const clean = p.startsWith("/") ? p : "/" + p
@@ -269,6 +319,24 @@ webdavRouter.all("/*", async (c) => {
         const { item, rawUrl } = await getItem(davPath, ctx)
         if (!item) return c.text("Not found", 404)
         if (item.is_dir) return c.text("Is a directory", 400)
+
+        // ── 虚拟 `.strm` 文件：必须返回**文本内容**，不能 302 ──────────────
+        //
+        // 对齐 Go `(d *Strm) Link` 的分支 ①：`.strm` 是虚拟文件，
+        // 内容是「一行播放 URL」。播放器读到后自行请求那行 URL。
+        //
+        // ⚠️ 此前这里对所有文件一律 302 到 `/api/p/...`，对 `.strm` 是致命的：
+        //   302 Location 仍以 `.strm` 结尾 → 自指 → 且该地址需要签名校验，
+        //   Location 里的 sign 校验不过 → **401** →
+        //   网易爆米花弹「网络异常，请确保网络正常且 WebDAV 地址正确后重试」。
+        const strmText = await getStrmContent(davPath, ctx)
+        if (strmText !== null) {
+          return c.body(strmText, 200, {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(new TextEncoder().encode(strmText).length),
+          })
+        }
+
         // 重定向到 rawRouter（/api/p/*）实际下载；rawRouter 已处理所有驱动的
         // 下载协议（proxy/redirect/stream + Range + SSRF 防护）
         const target =

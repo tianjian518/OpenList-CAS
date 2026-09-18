@@ -618,6 +618,59 @@ export class StrmDriver implements StorageDriver {
     throw new Error("[Strm] put is not supported")
   }
 
+  /**
+   * 取虚拟 `.strm` 文件的**文本内容**（即那行播放 URL）。
+   *
+   * 对齐 Go `(d *Strm) Link` 的**分支 ①**：
+   *
+   *   if file.GetID() == "strm" {
+   *     link := d.getLink(ctx, file.GetPath())
+   *     return &model.Link{RangeReader: strings.NewReader(link)}, nil
+   *   }
+   *
+   * 虚拟 `.strm` 不是真实字节流，它唯一的意义就是「内容是一行 URL」。
+   * 因此 `/p/xxx.strm` 与 `/dav/xxx.strm` 都必须**直接返回这行文本**，
+   * 而不能 302 到自身（那会自指死循环 + 签名校验失败 → 401）。
+   *
+   * 返回 `null` 表示该路径不是有效的虚拟 `.strm`（调用方应回退到其它分支）。
+   */
+  /**
+   * ⚠️ 不能用 `this.list()` 的返回值来找真实路径：`op` 层会把条目的
+   * `sign` 字段**覆盖成下载签名**（见 webdav driver 的同款注释），
+   * 驱动内部 `convert()` 存进去的原始路径会被冲掉。
+   * 因此这里直接查**底层真实文件**，按 convert() 的逆规则匹配虚拟名。
+   *
+   * 参数 `physicalPath` 是**存储内相对路径**（如 `/移动CAS/.../x.mp4.strm`），
+   * 与 `list()`/`get()` 的第二个参数同一语义（op 层传的是 `resolved.physical`）。
+   */
+  async strmContent(physicalPath: string): Promise<string | null> {
+    const path = physicalPath || "/"
+    if (!path.endsWith(".strm")) return null
+    const dir = dirname(path)
+    const name = basename(path)
+    const [root, sub] = getRootAndPath(path, this.autoFlatten, this.oneKey)
+    const dsts = this.pathMap.get(root) || []
+    for (const dst of dsts) {
+      const rawItems = await this.listRemote(dst, dirname(sub))
+      for (const raw of rawItems) {
+        if (raw.is_dir) continue
+        const ext = this.sourceExt(raw.name).toLowerCase()
+        // 只考虑会被 convert() 转成 .strm 的那类文件
+        // （supportSuffix 命中且非 downloadSuffix）
+        if (!this.supportSuffix.has(ext) || this.downloadSuffix.has(ext)) continue
+        const virtualName =
+          this.trimSuffix(raw.name, this.sourceExt(raw.name)) + "strm"
+        if (virtualName !== name) continue
+        // 命中：用**与 list() 一致的虚拟路径格式**生成播放 URL。
+        // list() 用的是 `joinPath(dst, sub)`（dst 为配置里的路径），
+        // 这里同样以 dst 打底拼真实文件名，保证签名对象两边完全一致。
+        const realPath = joinPath(dst, joinPath(dirname(sub), raw.name))
+        return await this.getLink(realPath)
+      }
+    }
+    return null
+  }
+
   /** .strm 文件内容：可播放直链 URL */
   async createReadStream(
     physicalPath: string,

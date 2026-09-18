@@ -369,6 +369,56 @@ rawRouter.get("/*", async (c) => {
             }
           }
 
+          // ── strm 驱动的**虚拟 .strm 文件**：直接返回内容（对齐 Go 分支 ①）──
+          //
+          // Go `(d *Strm) Link` 的第一件事就是**区分两类文件**：
+          //
+          //   if file.GetID() == "strm" {                     // ① 虚拟 .strm
+          //     link := d.getLink(ctx, file.GetPath())
+          //     return &model.Link{RangeReader: ...}, nil     //   → 响应体 = 那行 URL
+          //   }
+          //   reqPath := file.GetPath()
+          //   link, _, _ := d.link(ctx, reqPath, args)        // ② 真实文件：查底层
+          //   if link == nil {                                // ③ 走 /p 代理
+          //     return &model.Link{URL: .../p{EncodePath(reqPath)}?sign=...}
+          //   }
+          //
+          // ⚠️ **这里曾把两类文件混为一谈**，全部走 ③ 的 `/p` 代理，于是：
+          //
+          //   播放器 GET .../S01E01.mp4.strm
+          //   → 302 Location: /p/.../S01E01.mp4.strm?sign=…   ← 仍是 .strm！
+          //   → 播放器跟过去，又回到 strm 驱动
+          //   → 该地址需要签名校验，而 302 的 Location 里的 sign 校验不过
+          //   → **401 sign verify failed**
+          //   → 网易爆米花弹「网络异常，请确保网络正常且 WebDAV 地址正确后重试」
+          //
+          // `.strm` 是**虚拟文件**，它本身不是可下载的字节流 —— 它唯一的
+          // 意义就是「内容为一行播放 URL 的文本」。把它当真实文件去拼 `/p`
+          // 代理地址，必然自指死循环。
+          //
+          // 正确行为：**把 .strm 的内容（那行 URL）作为响应体直接返回**，
+          // 播放器读到后自行请求那行 URL（形如 `/d/...xxx.cas?sign=…`），
+          // 由 139 驱动那侧完成 CAS 还原与 302 CDN 直链。
+          if (normDriver === "strm" && /\.strm$/i.test(reqPath)) {
+            try {
+              const content = await (driver as any).strmContent(reqPath)
+              if (content) {
+                console.log(`[rawRouter] strm content for '${reqPath}'`)
+                c.header("Content-Type", "application/octet-stream")
+                c.header(
+                  "Cache-Control",
+                  "max-age=0, no-cache, no-store, must-revalidate",
+                )
+                return c.body(content, 200)
+              }
+            } catch (e: any) {
+              console.warn(
+                `[rawRouter] strm content failed for '${reqPath}':`,
+                e?.message,
+              )
+            }
+          }
+
           // ── strm 驱动的 /p 代理分支（对齐 Go `(d *Strm) Link` 的分支 ③）────
           //
           // Go 版 strm 驱动 `Config.OnlyProxy = true`，于是
