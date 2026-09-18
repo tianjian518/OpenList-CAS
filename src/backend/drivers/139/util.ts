@@ -530,11 +530,20 @@ export class Yun139ApiClient {
             parentFileId,
             pageInfo: {
               pageCursor: nextPageCursor,
-              pageSize: 100,
+              pageSize: 200,
             },
             orderBy: "updated_at",
             orderDirection: "DESC",
-            imageThumbnailStyleList: ["Small", "Large"],
+            // ⚠️ 不请求缩略图。
+            //
+            // 原值 `["Small", "Large"]` 会让 139 为**每个条目**附带
+            // 多档缩略图 URL（含签名串），响应体因此显著膨胀。而列表
+            // （WebDAV PROPFIND / fs/list）只用得到名称、大小、时间，
+            // 缩略图是前端详情页才需要的。
+            //
+            // 实测：去掉后单次 `listFiles` 的 2.7~3.4 秒进一步下降，
+            // 跨洲回程传输是这一段耗时的主要构成。
+            imageThumbnailStyleList: [],
           },
           true,
         )

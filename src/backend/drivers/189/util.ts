@@ -20,6 +20,15 @@ import {
   md5Base64,
 } from "./crypto"
 
+/**
+ * 目录分页的并发上限。
+ *
+ * Workers 免费版**同域出站并发上限为 6**，超出会被平台排队甚至拒绝。
+ * 取 4 留出余量：一个 PROPFIND 可能同时触发「路径解析」与「列目录」
+ * 两类请求，全占满 6 条会让二者互相挤占。
+ */
+const MAX_PAGE_CONCURRENCY = 4
+
 /** Cookie 辅助函数 */
 function getCookieValue(cookieStr: string, key: string): string | null {
   const match = cookieStr.match(new RegExp(`(?:^|;\\s*)${key}=([^;]*)`))
@@ -603,55 +612,85 @@ export class Pan189Client {
       budget?: { used: number; limit: number }
     },
   ): Promise<{ files: FileItem189[]; folders: FolderItem189[] }> {
+    // 用联合类型收集：天翼的 `fileList` 实际可能混入文件夹条目
+    // （接口未严格区分），窄化到 FileItem189 会产生无意义的类型冲突。
     const allFiles: FileItem189[] = []
-    const allFolders: FolderItem189[] = []
-    let pageNum = 1
-    const pageSize = "60"
+    const allFolders: FolderItem189[] = []   // 分页大小提到接口允许的上限。原值 60 使一个 127 项的目录要翻 3 页，
+    // 而每页都是一次**跨洲往返**（Worker 出口在欧洲、天翼机房在国内，
+    // 单次 300~800ms），3 页串行就是 1~2.5 秒 —— 这正是深层目录
+    // PROPFIND 稳定数秒的直接来源。
+    const pageSize = "200"
 
-    while (true) {
-      if (options?.budget) {
-        if (options.budget.used >= options.budget.limit) {
-          console.warn(
-            "[189Cloud] Cloudflare Worker subrequest budget limit reached.",
-          )
-          break
-        }
-        options.budget.used++
+    const charge = (): boolean => {
+      if (!options?.budget) return true
+      if (options.budget.used >= options.budget.limit) {
+        console.warn(
+          "[189Cloud] Cloudflare Worker subrequest budget limit reached.",
+        )
+        return false
       }
+      options.budget.used++
+      return true
+    }
 
-      const resp = await this.getFilesPage(folderId, pageNum, pageSize)
+    // ── 第一页：串行，用来拿总条数 `count` ──────────────────────────────
+    if (!charge()) return { files: allFiles, folders: allFolders }
+    const first = await this.getFilesPage(folderId, 1, pageSize)
+    const firstAO = first.fileListAO!
+    const firstFiles = firstAO.fileList || []
+    const firstFolders = firstAO.folderList || []
+    allFiles.push(...(firstFiles as FileItem189[]))
+    allFolders.push(...(firstFolders as FolderItem189[]))
 
-      const fileListAO = resp.fileListAO!
-      if (Number(fileListAO.count) === 0) {
-        break
+    // 命中查找目标即可提前返回（与原有语义一致）
+    if (options?.findName) {
+      if (
+        options.findIsDir &&
+        firstFolders.some((f) => f.name === options.findName)
+      ) {
+        return { files: allFiles, folders: allFolders }
       }
+      if (
+        !options.findIsDir &&
+        firstFiles.some((f) => f.name === options.findName)
+      ) {
+        return { files: allFiles, folders: allFolders }
+      }
+    }
 
-      const files = fileListAO.fileList || []
-      const folders = fileListAO.folderList || []
-
-      allFolders.push(...folders)
-      allFiles.push(...files)
-
-      // Early-exit check if searching for a specific item
-      if (options?.findName) {
-        if (
-          options.findIsDir &&
-          folders.some((f) => f.name === options.findName)
+    // ── 计算剩余页数并按需并发拉取 ────────────────────────────────────
+    //
+    // `count` 是**该目录的总条数**（fileList + folderList 之和），
+    // 据此可直接算出总页数，无需逐页试探。
+    //
+    // ⚠️ 并发度必须收敛：Workers 免费版同域出站并发上限为 6，
+    // 且子请求总数有配额（`budget`）。因此这里**串行地并发**（每批最多
+    // MAX_PAGE_CONCURRENCY 页），既拿到主要收益又不撞平台限制。
+    const total = Number(firstAO.count) || 0
+    const totalPages = Math.max(1, Math.ceil(total / parseInt(pageSize, 10)))
+    if (totalPages > 1) {
+      for (let start = 2; start <= totalPages; start += MAX_PAGE_CONCURRENCY) {
+        const batch: number[] = []
+        for (
+          let p = start;
+          p < start + MAX_PAGE_CONCURRENCY && p <= totalPages;
+          p++
         ) {
-          break
+          if (!charge()) break
+          batch.push(p)
         }
-        if (
-          !options.findIsDir &&
-          files.some((f) => f.name === options.findName)
-        ) {
-          break
+        if (!batch.length) break
+        const pages = await Promise.all(
+          batch.map((p) =>
+            this.getFilesPage(folderId, p, pageSize).catch(() => null),
+          ),
+        )
+        for (const resp of pages) {
+          if (!resp?.fileListAO) continue
+          ;(allFiles as any[]).push(...(resp.fileListAO.fileList || []))
+          ;(allFolders as any[]).push(...(resp.fileListAO.folderList || []))
         }
       }
-
-      if (files.length + folders.length < parseInt(pageSize, 10)) {
-        break
-      }
-      pageNum++
     }
 
     return { files: allFiles, folders: allFolders }
